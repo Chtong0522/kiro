@@ -14,18 +14,21 @@ MAX_POSITION  = 3      # 单笔 3U
 SAFETY_LINE   = 80     # USDC 低于此值暂停开仓
 MAX_POSITIONS = 6      # 最多同时持仓数量
 
-# ── 出手条件（高标准）──────────────────────────────────────────────────────────
-MIN_SM_WALLETS    = 5      # 至少5个聪明钱同时买入
-MAX_SOLD_RATIO    = 15     # 聪明钱卖出比例 < 15%（几乎没人跑）
-MIN_MC            = 10000  # 最小市值 $10k
-MAX_MC            = 300000 # 最大市值 $300k（小市值空间大）
-MAX_BUNDLE        = 20     # bundle率 < 20%
-MAX_RUG_RATIO     = 0.20   # rug风险 < 0.20
-MAX_TOP10         = 0.50   # top10持仓 < 50%
-MAX_SNIPER        = 20     # sniper < 20
-REQUIRE_DUAL_SRC  = True   # 必须 OKX + GMGN 双信号同时出现
-KLINE_HIGH_PCT    = 0.90   # 价格不超过1h高点90%
-KLINE_VOL_PCT     = 0.65   # 量能缩减到均量65%以下
+# ── 出手条件（基于真实数据校准）─────────────────────────────────────────────────
+# 实证：BMNTP(+12000%) 早期 SM=3, bundle=38%, sniper=28, top10=12%, soldRatio<20%
+# 结论：bundle/sniper 不是淘汰指标，SM数量3个+低soldRatio+低top10才是核心
+MIN_SM_WALLETS    = 3      # 至少3个聪明钱（早期真实机会只有3-4个）
+MAX_SOLD_RATIO    = 25     # 聪明钱卖出比例 < 25%
+MIN_MC            = 5000   # 最小市值 $5k（早期机会更小）
+MAX_MC            = 200000 # 最大市值 $200k（小市值空间大）
+MAX_BUNDLE        = 45     # bundle率放宽（BMNTP=38%仍然涨了）
+MAX_RUG_RATIO     = 0.25   # rug风险 < 0.25
+MAX_TOP10         = 0.45   # top10持仓 < 45%（BMNTP=12%，这个阈值合理）
+MAX_SNIPER        = 35     # sniper放宽（BMNTP=28仍然涨了）
+REQUIRE_DUAL_SRC  = False  # 先单源，WS积累数据后再开启
+KLINE_HIGH_PCT    = 0.95   # 新开盘直接拉无回调，放宽到95%
+KLINE_VOL_PCT     = 0.80   # 放宽量能要求
+KLINE_AGE_SKIP    = 600    # 开盘后10分钟内跳过K线检查（新开盘无回调窗口）
 
 LOG_FILE = "/tmp/meme_hunter_v3.log"
 
@@ -282,37 +285,41 @@ def gate_check(addr):
     return True, "PASS"
 
 # ─── K线时机检查 ──────────────────────────────────────────────────────────────
-def kline_check(addr):
-    tf = int(time.time()) - 3600
-    tt = int(time.time())
+def kline_check(addr, token_open_ts=0):
+    now_ts = int(time.time())
+
+    # 新开盘10分钟内跳过K线检查（开盘即拉无回调窗口）
+    if token_open_ts > 0:
+        age_sec = now_ts - token_open_ts
+        if age_sec < KLINE_AGE_SKIP:
+            return True, f"new_token age={age_sec}s skip_kline"
+
+    tf = now_ts - 3600
     out = run(
         f"gmgn-cli market kline --chain sol --address {addr} "
-        f"--resolution 5m --from {tf} --to {tt} --raw", timeout=20
+        f"--resolution 5m --from {tf} --to {now_ts} --raw", timeout=20
     )
     d = jparse(out)
     candles = d.get("list", [])
-    if len(candles) < 4:
-        return False, "no kline data"
+    if len(candles) < 3:
+        # 数据不足时放行（新币数据可能不完整）
+        return True, "kline:insufficient_data(pass)"
 
     closes = [float(c["close"]) for c in candles]
     vols   = [float(c["volume"]) for c in candles]
     highs  = [float(c["high"]) for c in candles]
     high1h = max(highs)
-    avg_p  = sum(closes) / len(closes)
-    cur    = closes[-1]
     avg_v  = sum(vols) / len(vols) if vols else 1
     last2v = sum(vols[-2:]) / 2 if len(vols) >= 2 else avg_v
+    cur    = closes[-1]
 
-    pct_h  = cur / high1h if high1h > 0 else 1
-    pct_av = abs(cur - avg_p) / avg_p if avg_p > 0 else 1
-    vol_r  = last2v / avg_v if avg_v > 0 else 1
+    pct_h = cur / high1h if high1h > 0 else 1
+    vol_r = last2v / avg_v if avg_v > 0 else 1
 
     if pct_h > KLINE_HIGH_PCT:
         return False, f"KL:price={pct_h:.0%}ofHigh"
     if vol_r > KLINE_VOL_PCT:
         return False, f"KL:vol={vol_r:.0%} not declining"
-    if pct_av > 0.35:
-        return False, f"KL:+-{pct_av:.0%}fromAvg"
 
     return True, f"{pct_h:.0%}ofHigh vol={vol_r:.0%}"
 
