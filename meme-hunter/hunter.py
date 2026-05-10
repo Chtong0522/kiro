@@ -14,21 +14,29 @@ MAX_POSITION  = 3      # 单笔 3U
 SAFETY_LINE   = 80     # USDC 低于此值暂停开仓
 MAX_POSITIONS = 6      # 最多同时持仓数量
 
-# ── 出手条件（基于真实数据校准）─────────────────────────────────────────────────
-# 实证：BMNTP(+12000%) 早期 SM=3, bundle=38%, sniper=28, top10=12%, soldRatio<20%
-# 结论：bundle/sniper 不是淘汰指标，SM数量3个+低soldRatio+低top10才是核心
-MIN_SM_WALLETS    = 3      # 至少3个聪明钱（早期真实机会只有3-4个）
-MAX_SOLD_RATIO    = 25     # 聪明钱卖出比例 < 25%
-MIN_MC            = 5000   # 最小市值 $5k（早期机会更小）
-MAX_MC            = 200000 # 最大市值 $200k（小市值空间大）
-MAX_BUNDLE        = 45     # bundle率放宽（BMNTP=38%仍然涨了）
+# ── 出手条件（基于65个样本真实数据校准 v3.2）──────────────────────────────────────
+#
+# 关键发现（SM组 vs 无SM组 对比）：
+#   1. creator_close 是 100% SM币的共同特征 → 加入强制过滤
+#   2. TOP10 在 SM币中普遍 12-22%，危险阈值 >50%
+#   3. bundle/sniper 无法排除高倍币（BMNTP bundle=36% 涨12000%，Bear sniper=79 涨831%）
+#   4. soldRatioPercent 含义：<30%=SM未跑，30-50%=出本金但仍持有，>50%=信号失效
+#   5. SM数量 >= 10 为强信号，SM=3-9 为中等信号
+#   6. 危险无SM组特征：top10>80% 或 bundle=100% 且 SM=0
+
+MIN_SM_WALLETS    = 3      # 至少3个聪明钱（早期信号仅3-4个，等SM=10再进就晚了）
+MAX_SOLD_RATIO    = 50     # soldRatio < 50%（出了本金但还持仓的SM仍是有效信号）
+MIN_MC            = 15000  # 最小市值 $15k（过低的MC数据质量差，信号不可靠）
+MAX_MC            = 500000 # 最大市值 $500k（SM信号出现时MC已到几十万，不限太死）
+MAX_BUNDLE        = 50     # bundle无淘汰效力，设50%仅过滤极端情况（bundle=100%）
 MAX_RUG_RATIO     = 0.25   # rug风险 < 0.25
-MAX_TOP10         = 0.45   # top10持仓 < 45%（BMNTP=12%，这个阈值合理）
-MAX_SNIPER        = 35     # sniper放宽（BMNTP=28仍然涨了）
-REQUIRE_DUAL_SRC  = False  # 先单源，WS积累数据后再开启
-KLINE_HIGH_PCT    = 0.95   # 新开盘直接拉无回调，放宽到95%
-KLINE_VOL_PCT     = 0.80   # 放宽量能要求
-KLINE_AGE_SKIP    = 600    # 开盘后10分钟内跳过K线检查（新开盘无回调窗口）
+MAX_TOP10         = 0.40   # top10 < 40%（SM币实测12-22%，40%已足够宽松）
+MAX_SNIPER        = 100    # sniper不作为淘汰条件（Bear sniper=79仍然涨831%）
+DEV_MUST_CLOSE    = True   # creator_close 强制要求（SM组100%验证）
+REQUIRE_DUAL_SRC  = False  # 先单源，积累数据后再开启
+KLINE_HIGH_PCT    = 0.95   # 开盘即拉无回调，放宽到95%
+KLINE_VOL_PCT     = 0.80   # 量能要求
+KLINE_AGE_SKIP    = 600    # 开盘后10分钟内跳过K线检查
 
 LOG_FILE = "/tmp/meme_hunter_v3.log"
 
@@ -251,14 +259,13 @@ def gate_check(addr):
             return False, f"G2:rug={d2.get('rug_ratio')}"
         if float(d2.get("top_10_holder_rate") or 0) > MAX_TOP10:
             return False, f"G4:top10={d2.get('top_10_holder_rate')}"
-        if int(d2.get("sniper_count") or 0) > MAX_SNIPER:
-            return False, f"G2:snipers={d2.get('sniper_count')}"
+        # creator_close 强制要求（65个样本中SM组100%验证为creator_close）
         cstatus = d2.get("creator_token_status", "")
-        rug_cnt = int(d2.get("dev_rug_count") or 0)
-        if cstatus == "creator_hold" and rug_cnt > 20:
-            return False, f"G2:dev_hold+rug={rug_cnt}"
+        if DEV_MUST_CLOSE and cstatus == "creator_hold":
+            return False, "G2:dev_still_holding"
         if d2.get("is_wash_trading"):
             return False, "G4:wash"
+        # sniper 不再作为淘汰条件（Bear sniper=79 仍然涨831%）
 
     # Gate 3: Bundle
     out3 = run(f"onchainos memepump token-bundle-info --address {addr}", timeout=20)
