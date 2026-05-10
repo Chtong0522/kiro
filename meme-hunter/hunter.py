@@ -11,7 +11,7 @@ WALLET      = "AXBCfbioEHiJ48ejNp5feEzWt2iHFLUDNMk27t5vXWLE"
 USDC_ADDR   = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 COMP_ID     = "113"
 
-SCAN_INTERVAL   = 300    # 5分钟一轮
+SCAN_INTERVAL   = 30     # 30秒一轮，持续高频扫描
 MAX_POSITION    = 3      # 单笔 3U（测试阶段）
 SAFETY_LINE     = 80     # USDC < 80 停止开新仓
 
@@ -258,6 +258,7 @@ def check_positions(positions):
 # ─── 主循环 ────────────────────────────────────────────────────────────────────
 def main():
     seen = set()
+    seen_time = {}   # addr -> timestamp，超过10分钟重新评估
     positions = {}
     round_num = 0
 
@@ -289,7 +290,13 @@ def main():
         gmgn_sigs = get_gmgn_signals()
         log(f"Signals: OKX={len(okx_sigs)} GMGN={len(gmgn_sigs)}")
 
-        # 合并去重
+        # 合并去重（超过10分钟的token重新允许评估）
+        now_ts = time.time()
+        for addr in list(seen_time.keys()):
+            if now_ts - seen_time[addr] > 600:
+                seen.discard(addr)
+                del seen_time[addr]
+
         candidates = {}
         for s in okx_sigs + gmgn_sigs:
             addr = s["addr"]
@@ -309,6 +316,7 @@ def main():
             mc     = c.get("mc", 0)
             source = c.get("source", "?")
             seen.add(addr)
+            seen_time[addr] = time.time()
 
             log(f"\n  [{source}] {sym} MC=${mc:.0f} signals={c.get('count',0)} sold={c.get('sold',0):.0f}%")
 
