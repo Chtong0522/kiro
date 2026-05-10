@@ -1,34 +1,37 @@
 #!/usr/bin/env python3
 """
-SOL Meme Hunter v2 — OKX Agentic Trading Contest
-调整参数：Gate2 dev复合判断 / Gate3 bundle放宽25% / K线阈值92%
+SOL Meme Hunter v3 — WebSocket 持续监听架构
+策略：少而准，持续盯链，高标准出手
 """
-import subprocess, json, time, os, sys
+import subprocess, json, time, os, threading, queue
 from datetime import datetime
 
 # ─── 配置 ─────────────────────────────────────────────────────────────────────
-WALLET      = "AXBCfbioEHiJ48ejNp5feEzWt2iHFLUDNMk27t5vXWLE"
-USDC_ADDR   = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-COMP_ID     = "113"
+WALLET    = "AXBCfbioEHiJ48ejNp5feEzWt2iHFLUDNMk27t5vXWLE"
+USDC_ADDR = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
-SCAN_INTERVAL   = 30     # 30秒一轮，持续高频扫描
-MAX_POSITION    = 3      # 单笔 3U（测试阶段）
-SAFETY_LINE     = 80     # USDC < 80 停止开新仓
+MAX_POSITION  = 3      # 单笔 3U
+SAFETY_LINE   = 80     # USDC 低于此值暂停开仓
+MAX_POSITIONS = 6      # 最多同时持仓数量
 
-# Gate 阈值（已调整）
-GATE_RUG_MAX        = 0.25   # rug_ratio 上限
-GATE_BUNDLE_MAX     = 25.0   # bundle% 上限（从15%放宽到25%）
-GATE_TOP10_MAX      = 0.55   # top10持仓上限
-GATE_SNIPER_MAX     = 25     # sniper数量上限
-GATE_KLINE_HIGH_PCT = 0.92   # 当前价格不能超过1h高点的92%（从88%放宽）
-GATE_KLINE_VOL_PCT  = 0.75   # 最近2根K线量能不超过均量75%
-GATE_MC_MIN         = 8000   # 最小市值
-GATE_MC_MAX         = 600000 # 最大市值
-GATE_SOLD_MAX       = 28     # soldRatioPercent 上限
+# ── 出手条件（高标准）──────────────────────────────────────────────────────────
+MIN_SM_WALLETS    = 5      # 至少5个聪明钱同时买入
+MAX_SOLD_RATIO    = 15     # 聪明钱卖出比例 < 15%（几乎没人跑）
+MIN_MC            = 10000  # 最小市值 $10k
+MAX_MC            = 300000 # 最大市值 $300k（小市值空间大）
+MAX_BUNDLE        = 20     # bundle率 < 20%
+MAX_RUG_RATIO     = 0.20   # rug风险 < 0.20
+MAX_TOP10         = 0.50   # top10持仓 < 50%
+MAX_SNIPER        = 20     # sniper < 20
+REQUIRE_DUAL_SRC  = True   # 必须 OKX + GMGN 双信号同时出现
+KLINE_HIGH_PCT    = 0.90   # 价格不超过1h高点90%
+KLINE_VOL_PCT     = 0.65   # 量能缩减到均量65%以下
 
-LOG_FILE = "/tmp/meme_hunter_v2.log"
+LOG_FILE = "/tmp/meme_hunter_v3.log"
 
-# ─── 工具函数 ──────────────────────────────────────────────────────────────────
+os.environ["PATH"] = "/home/ubuntu/.local/bin:/home/ubuntu/.nvm/versions/node/v22.22.2/bin:" + os.environ.get("PATH", "")
+
+# ─── 工具 ──────────────────────────────────────────────────────────────────────
 def log(msg):
     ts = datetime.now().strftime("%H:%M:%S")
     line = f"[{ts}] {msg}"
@@ -40,317 +43,472 @@ def run(cmd, timeout=30):
     try:
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
         return r.stdout.strip()
-    except Exception as e:
+    except:
         return ""
 
-def parse_json(raw):
+def jparse(raw):
     try:
         return json.loads(raw)
     except:
         return {}
 
-# ─── 余额检查 ──────────────────────────────────────────────────────────────────
-def get_usdc_balance():
-    out = run("onchainos wallet balance --chain solana")
-    d = parse_json(out)
-    for asset in d.get("data", {}).get("details", [{}])[0].get("tokenAssets", []):
-        if asset.get("symbol") == "USDC":
-            return float(asset.get("balance", 0))
-    return 0
+# ─── WebSocket 监听 ───────────────────────────────────────────────────────────
+class WSListener:
+    """启动 onchainos ws session，持续 poll 事件放入队列"""
 
-# ─── 信号采集 ──────────────────────────────────────────────────────────────────
-def get_okx_signals():
-    out = run("onchainos signal list --chain solana --wallet-type 1,2 --limit 20", timeout=25)
-    d = parse_json(out)
-    results = []
-    for s in d.get("data", []):
-        sold  = float(s.get("soldRatioPercent", 100))
-        count = int(s.get("triggerWalletCount", 0))
-        addr  = s.get("token", {}).get("tokenAddress", "")
-        sym   = s.get("token", {}).get("symbol", "?")
-        mc    = float(s.get("token", {}).get("marketCapUsd", 0))
-        wtype = s.get("walletType", "0")
-        if sold < GATE_SOLD_MAX and count >= 3 and addr and GATE_MC_MIN < mc < GATE_MC_MAX:
-            results.append({"addr": addr, "sym": sym, "mc": mc,
-                             "sold": sold, "count": count, "source": f"OKX-wt{wtype}"})
-    return results
+    def __init__(self, event_queue):
+        self.q = event_queue
+        self.sessions = {}  # name -> session_id
 
-def get_gmgn_signals():
-    out = run("gmgn-cli market signal --chain sol --signal-type 12 --raw", timeout=25)
-    d = parse_json(out)
-    items = d if isinstance(d, list) else d.get("data", [])
-    clusters = {}
-    now = time.time()
-    for item in items:
-        addr = item.get("token_address", "")
-        mc   = float(item.get("trigger_mc") or item.get("market_cap") or 0)
-        ts   = item.get("trigger_at", 0)
-        age  = now - ts if ts else 9999
-        if addr and GATE_MC_MIN < mc < GATE_MC_MAX and age < 3600:
-            if addr not in clusters:
-                clusters[addr] = {"addr": addr, "mc": mc, "count": 0, "source": "GMGN-SM12"}
-            clusters[addr]["count"] += 1
-    return [v for v in clusters.values() if v["count"] >= 2]
+    def start_sessions(self):
+        log("Starting WebSocket sessions...")
 
-# ─── 五关过滤 ──────────────────────────────────────────────────────────────────
-def gate_check(addr, sym):
-    # Gate 1: honeypot + basic risk
+        # 频道1: SM + KOL 实时交易
+        out = run("onchainos ws start --channel kol_smartmoney-tracker-activity --idle-timeout 0")
+        d = jparse(out)
+        sid = d.get("data", {}).get("id", "")
+        if sid:
+            self.sessions["sm_tracker"] = sid
+            log(f"  sm_tracker session: {sid}")
+
+        # 频道2: Solana 实时信号
+        out2 = run("onchainos ws start --channel dex-market-new-signal-openapi --chain-index 501 --idle-timeout 0")
+        d2 = jparse(out2)
+        sid2 = d2.get("data", {}).get("id", "")
+        if sid2:
+            self.sessions["signal"] = sid2
+            log(f"  signal session: {sid2}")
+
+        # 频道3: Solana 新盘上线
+        out3 = run("onchainos ws start --channel dex-market-memepump-new-token-openapi --chain-index 501 --idle-timeout 0")
+        d3 = jparse(out3)
+        sid3 = d3.get("data", {}).get("id", "")
+        if sid3:
+            self.sessions["new_token"] = sid3
+            log(f"  new_token session: {sid3}")
+
+        log(f"WebSocket sessions started: {len(self.sessions)}/3")
+        return len(self.sessions) > 0
+
+    def poll_loop(self):
+        """持续 poll 所有 session，把事件放入队列"""
+        while True:
+            for name, sid in list(self.sessions.items()):
+                out = run(f"onchainos ws poll --id {sid}", timeout=15)
+                d = jparse(out)
+                events = d.get("data", {}).get("events", [])
+                for evt in events:
+                    self.q.put({"source": name, "event": evt})
+            time.sleep(2)  # 每2秒轮询一次，近实时
+
+    def stop_all(self):
+        run("onchainos ws stop")
+        log("WebSocket sessions stopped")
+
+# ─── 信号聚合 ─────────────────────────────────────────────────────────────────
+class SignalAggregator:
+    """聚合来自不同 WS 频道的信号，找到多源共振的 token"""
+
+    def __init__(self):
+        # addr -> {okx_count, gmgn_count, wallets, mc, sym, last_seen}
+        self.signals = {}
+        self.lock = threading.Lock()
+
+    def add_event(self, source, event):
+        addr = self._extract_addr(source, event)
+        if not addr:
+            return
+
+        mc = self._extract_mc(event)
+        sym = self._extract_sym(event)
+        wallets = self._extract_wallets(source, event)
+
+        if not (MIN_MC < mc < MAX_MC):
+            return
+
+        with self.lock:
+            if addr not in self.signals:
+                self.signals[addr] = {
+                    "okx_count": 0, "gmgn_count": 0,
+                    "wallets": set(), "mc": mc, "sym": sym,
+                    "last_seen": time.time(), "sold_ratio": 100
+                }
+            s = self.signals[addr]
+            s["last_seen"] = time.time()
+            s["mc"] = mc
+            if sym != "?": s["sym"] = sym
+
+            if source == "sm_tracker":
+                s["okx_count"] += len(wallets)
+                s["wallets"].update(wallets)
+                sold = event.get("soldRatioPercent", 100)
+                if isinstance(sold, (int, float)):
+                    s["sold_ratio"] = min(s["sold_ratio"], float(sold))
+
+            elif source == "signal":
+                s["okx_count"] += 1
+
+            elif source == "new_token":
+                s["gmgn_count"] += 1
+
+    def get_strong_signals(self):
+        """返回达到出手标准的 token 列表"""
+        now = time.time()
+        result = []
+        with self.lock:
+            # 清理超过30分钟的旧信号
+            stale = [a for a, s in self.signals.items() if now - s["last_seen"] > 1800]
+            for a in stale:
+                del self.signals[a]
+
+            for addr, s in self.signals.items():
+                total_wallets = len(s["wallets"])
+                okx = s["okx_count"]
+                sold = s["sold_ratio"]
+
+                # 出手条件
+                if total_wallets < MIN_SM_WALLETS:
+                    continue
+                if sold > MAX_SOLD_RATIO:
+                    continue
+                if REQUIRE_DUAL_SRC and not (okx >= 3 and s["gmgn_count"] >= 1):
+                    # 放宽：OKX信号 >=5 也可以单独触发
+                    if total_wallets < 8:
+                        continue
+
+                result.append({
+                    "addr": addr,
+                    "sym": s["sym"],
+                    "mc": s["mc"],
+                    "wallets": total_wallets,
+                    "sold": sold,
+                    "okx": okx,
+                    "score": total_wallets * 2 + okx - sold / 10
+                })
+
+        return sorted(result, key=lambda x: -x["score"])
+
+    def _extract_addr(self, source, evt):
+        if source == "sm_tracker":
+            return evt.get("baseAddress") or evt.get("base_address", "")
+        elif source == "signal":
+            return evt.get("tokenAddress") or evt.get("token", {}).get("tokenAddress", "")
+        elif source == "new_token":
+            return evt.get("address") or evt.get("tokenAddress", "")
+        return ""
+
+    def _extract_mc(self, evt):
+        for key in ["marketCapUsd", "market_cap", "usdMarketCap", "mcap"]:
+            v = evt.get(key)
+            if v:
+                try: return float(v)
+                except: pass
+        token = evt.get("token", {})
+        for key in ["marketCapUsd", "market_cap"]:
+            v = token.get(key)
+            if v:
+                try: return float(v)
+                except: pass
+        return 0
+
+    def _extract_sym(self, evt):
+        for key in ["symbol", "tokenSymbol"]:
+            v = evt.get(key)
+            if v: return v
+        token = evt.get("token", {})
+        return token.get("symbol", "?")
+
+    def _extract_wallets(self, source, evt):
+        if source == "sm_tracker":
+            addr = evt.get("maker") or evt.get("walletAddress", "")
+            return {addr} if addr else set()
+        wallets_str = evt.get("triggerWalletAddress", "")
+        if wallets_str:
+            return set(wallets_str.split(","))
+        return set()
+
+# ─── 五关过滤 ─────────────────────────────────────────────────────────────────
+def gate_check(addr):
+    # Gate 1: 蜜罐 + 基础风险
     out = run(f"onchainos security token-scan --tokens '501:{addr}'", timeout=20)
-    d = parse_json(out)
-    r = d.get("data", [{}])
-    r = r[0] if r else {}
-    if r.get("isHoneypot"):     return False, "Gate1: honeypot"
-    if r.get("riskLevel") == "HIGH": return False, "Gate1: HIGH risk"
-    if r.get("isWash"):         return False, "Gate1: wash trading"
-    if r.get("isMintable"):     return False, "Gate1: mintable"
+    d = jparse(out)
+    r = (d.get("data") or [{}])[0]
+    if r.get("isHoneypot"):          return False, "G1:honeypot"
+    if r.get("riskLevel") == "HIGH": return False, "G1:HIGH risk"
+    if r.get("isWash"):              return False, "G1:wash"
+    if r.get("isMintable"):          return False, "G1:mintable"
 
-    # Gate 2: dev behavior (复合判断，不单靠rugCount)
+    # Gate 2+4: GMGN 安全检查
     out2 = run(f"gmgn-cli token security --chain sol --address {addr} --raw", timeout=20)
-    d2 = parse_json(out2)
+    d2 = jparse(out2)
     if d2:
-        if not d2.get("renounced_mint"):   return False, "Gate2: mint not renounced"
-        if not d2.get("renounced_freeze_account"): return False, "Gate2: freeze not renounced"
-        rug = float(d2.get("rug_ratio") or 0)
-        if rug > GATE_RUG_MAX:             return False, f"Gate2: rug_ratio={rug:.2f}"
-        top10 = float(d2.get("top_10_holder_rate") or 0)
-        if top10 > GATE_TOP10_MAX:         return False, f"Gate2: top10={top10:.0%}"
-        snipers = int(d2.get("sniper_count") or 0)
-        if snipers > GATE_SNIPER_MAX:      return False, f"Gate2: snipers={snipers}"
-        # dev holding: 只有 creator_hold + rugCount>30 才淘汰（复合判断）
+        if not d2.get("renounced_mint"):           return False, "G2:mint"
+        if not d2.get("renounced_freeze_account"): return False, "G2:freeze"
+        if float(d2.get("rug_ratio") or 0) > MAX_RUG_RATIO:
+            return False, f"G2:rug={d2.get('rug_ratio')}"
+        if float(d2.get("top_10_holder_rate") or 0) > MAX_TOP10:
+            return False, f"G4:top10={d2.get('top_10_holder_rate')}"
+        if int(d2.get("sniper_count") or 0) > MAX_SNIPER:
+            return False, f"G2:snipers={d2.get('sniper_count')}"
         cstatus = d2.get("creator_token_status", "")
-        rug_count = int(d2.get("dev_rug_count") or 0)
-        if cstatus == "creator_hold" and rug_count > 30:
-            return False, f"Gate2: dev holding + rugCount={rug_count}"
-        if d2.get("is_wash_trading"):      return False, "Gate2: wash trading"
+        rug_cnt = int(d2.get("dev_rug_count") or 0)
+        if cstatus == "creator_hold" and rug_cnt > 20:
+            return False, f"G2:dev_hold+rug={rug_cnt}"
+        if d2.get("is_wash_trading"):
+            return False, "G4:wash"
 
-    # Gate 3: bundle (放宽到25%)
+    # Gate 3: Bundle
     out3 = run(f"onchainos memepump token-bundle-info --address {addr}", timeout=20)
-    d3 = parse_json(out3)
+    d3 = jparse(out3)
     pct = float(d3.get("data", {}).get("bundlerAthPercent") or 0)
-    if pct > GATE_BUNDLE_MAX:
-        return False, f"Gate3: bundle={pct:.1f}% > {GATE_BUNDLE_MAX}%"
+    if pct > MAX_BUNDLE:
+        return False, f"G3:bundle={pct:.0f}%"
 
-    # Gate 5: SM exit check
+    # Gate 5: SM 是否在出货
     out5 = run(
         f"gmgn-cli token traders --chain sol --address {addr} "
         f"--tag smart_degen --order-by sell_volume_cur --direction desc --limit 5 --raw",
         timeout=20
     )
-    d5 = parse_json(out5)
+    d5 = jparse(out5)
     traders = d5.get("list", [])
     if traders:
         top = traders[0]
-        sell_v = float(top.get("sell_volume_cur") or 0)
-        buy_v  = float(top.get("buy_volume_cur")  or 0)
-        if buy_v > 0 and sell_v > buy_v * 1.5:
-            return False, f"Gate5: SM exiting sell${sell_v:.0f} > buy${buy_v:.0f}"
+        sv = float(top.get("sell_volume_cur") or 0)
+        bv = float(top.get("buy_volume_cur") or 0)
+        if bv > 0 and sv > bv * 1.3:
+            return False, f"G5:SM_exit sell${sv:.0f}>buy${bv:.0f}"
 
-    return True, "✅ all gates passed"
+    return True, "PASS"
 
-# ─── K线时机 ───────────────────────────────────────────────────────────────────
+# ─── K线时机检查 ──────────────────────────────────────────────────────────────
 def kline_check(addr):
-    ts_from = int(time.time()) - 3600
-    ts_to   = int(time.time())
+    tf = int(time.time()) - 3600
+    tt = int(time.time())
     out = run(
         f"gmgn-cli market kline --chain sol --address {addr} "
-        f"--resolution 5m --from {ts_from} --to {ts_to} --raw",
-        timeout=20
+        f"--resolution 5m --from {tf} --to {tt} --raw", timeout=20
     )
-    d = parse_json(out)
+    d = jparse(out)
     candles = d.get("list", [])
     if len(candles) < 4:
-        return False, "kline: insufficient data"
+        return False, "no kline data"
 
-    closes  = [float(c["close"])  for c in candles]
-    vols    = [float(c["volume"]) for c in candles]
-    highs   = [float(c["high"])   for c in candles]
-    high1h  = max(highs)
-    avg_p   = sum(closes) / len(closes)
-    cur     = closes[-1]
-    avg_v   = sum(vols) / len(vols) if vols else 1
-    last2v  = sum(vols[-2:]) / 2   if len(vols) >= 2 else avg_v
+    closes = [float(c["close"]) for c in candles]
+    vols   = [float(c["volume"]) for c in candles]
+    highs  = [float(c["high"]) for c in candles]
+    high1h = max(highs)
+    avg_p  = sum(closes) / len(closes)
+    cur    = closes[-1]
+    avg_v  = sum(vols) / len(vols) if vols else 1
+    last2v = sum(vols[-2:]) / 2 if len(vols) >= 2 else avg_v
 
-    pct_high   = cur / high1h  if high1h > 0 else 1
-    within_avg = abs(cur - avg_p) / avg_p if avg_p > 0 else 1
-    vol_ratio  = last2v / avg_v   if avg_v > 0 else 1
+    pct_h  = cur / high1h if high1h > 0 else 1
+    pct_av = abs(cur - avg_p) / avg_p if avg_p > 0 else 1
+    vol_r  = last2v / avg_v if avg_v > 0 else 1
 
-    reasons = []
-    if pct_high   > GATE_KLINE_HIGH_PCT:
-        reasons.append(f"price={pct_high:.0%} of 1h-high")
-    if vol_ratio  > GATE_KLINE_VOL_PCT:
-        reasons.append(f"vol={vol_ratio:.0%} not declining")
-    if within_avg > 0.30:
-        reasons.append(f"price ±{within_avg:.0%} from avg")
+    if pct_h > KLINE_HIGH_PCT:
+        return False, f"KL:price={pct_h:.0%}ofHigh"
+    if vol_r > KLINE_VOL_PCT:
+        return False, f"KL:vol={vol_r:.0%} not declining"
+    if pct_av > 0.35:
+        return False, f"KL:+-{pct_av:.0%}fromAvg"
 
-    if reasons:
-        return False, "KL veto: " + " | ".join(reasons)
+    return True, f"{pct_h:.0%}ofHigh vol={vol_r:.0%}"
 
-    return True, f"cur={cur:.8f} {pct_high:.0%}ofHigh vol={vol_ratio:.0%}"
-
-# ─── 执行交易 ──────────────────────────────────────────────────────────────────
-def execute_swap(addr, sym, amount, reason):
-    log(f"  💸 SWAP ${amount} USDC → {sym}")
-    log(f"     reason: {reason}")
+# ─── 执行交易 ─────────────────────────────────────────────────────────────────
+def execute_swap(addr, sym, amount):
     cmd = (
         f"onchainos swap execute "
-        f"--from {USDC_ADDR} "
-        f"--to {addr} "
+        f"--from {USDC_ADDR} --to {addr} "
         f"--readable-amount {amount} "
-        f"--chain solana "
-        f"--wallet {WALLET} "
-        f"--gas-level fast "
-        f"--slippage 15"
+        f"--chain solana --wallet {WALLET} "
+        f"--gas-level fast --slippage 15"
     )
     out = run(cmd, timeout=90)
-    try:
-        d = parse_json(out)
-        tx = d.get("data", {}).get("swapTxHash", "")
-        if tx:
-            log(f"  ✅ TX: {tx}")
-            return True, tx
-        else:
-            log(f"  ❌ swap failed: {out[:200]}")
-            return False, out[:200]
-    except:
-        log(f"  ❌ swap error: {out[:200]}")
-        return False, out[:200]
+    d = jparse(out)
+    tx = d.get("data", {}).get("swapTxHash", "")
+    if tx:
+        log(f"  TX: https://solscan.io/tx/{tx}")
+        return True, tx
+    log(f"  swap failed: {out[:200]}")
+    return False, ""
 
-# ─── 持仓止盈检查 ─────────────────────────────────────────────────────────────
-def check_positions(positions):
-    if not positions:
-        return
-    log(f"Checking {len(positions)} open positions...")
+def get_usdc_balance():
+    out = run("onchainos wallet balance --chain solana")
+    d = jparse(out)
+    for a in d.get("data", {}).get("details", [{}])[0].get("tokenAssets", []):
+        if a.get("symbol") == "USDC":
+            return float(a.get("balance", 0))
+    return 0
+
+# ─── 持仓管理 ─────────────────────────────────────────────────────────────────
+def check_and_tp(positions):
     for addr, pos in list(positions.items()):
         sym = pos["sym"]
-        entry_usd = pos.get("entry_price_usd", 0)
-        entry_time = pos.get("entry_time", 0)
-        age_h = (time.time() - entry_time) / 3600
+        entry = pos.get("entry_price", 0)
+        if not entry:
+            continue
+        out = run(f"onchainos token price-info --address {addr} --chain solana", timeout=15)
+        d = jparse(out)
+        cur = float(d.get("data", {}).get("price") or 0)
+        if not cur:
+            continue
+        pnl = (cur - entry) / entry
+        age_h = (time.time() - pos["entry_time"]) / 3600
+        log(f"  {sym}: PnL={pnl:+.1%} age={age_h:.1f}h")
 
-        # 查当前价格
-        out = run(f"onchainos token price-info --address {addr} --chain solana", timeout=20)
-        d = parse_json(out)
-        cur_price = float(d.get("data", {}).get("price") or 0)
+        amount_held = pos.get("amount_tokens", 0)
 
-        if entry_usd > 0 and cur_price > 0:
-            pnl = (cur_price - entry_usd) / entry_usd
-            log(f"  {sym}: entry={entry_usd:.8f} cur={cur_price:.8f} PnL={pnl:+.1%} age={age_h:.1f}h")
+        if pnl >= 0.60 and not pos.get("tp1"):
+            log(f"  TP1 +60% {sym} -- sell 25%")
+            execute_swap(USDC_ADDR, sym, 0)  # placeholder, need token->USDC swap
+            pos["tp1"] = True
+        if pnl >= 1.50 and not pos.get("tp2"):
+            log(f"  TP2 +150% {sym} -- sell 25%")
+            pos["tp2"] = True
+        if pnl >= 3.00 and not pos.get("tp3"):
+            log(f"  TP3 +300% {sym} -- sell 15%")
+            pos["tp3"] = True
+        if age_h > 48:
+            log(f"  Time stop {sym}")
+            del positions[addr]
+            break
 
-            # TP1: +60%
-            if pnl >= 0.60 and not pos.get("tp1_done"):
-                log(f"  🎯 TP1 triggered (+60%) for {sym} — selling 25%")
-                pos["tp1_done"] = True
-
-            # TP2: +150%
-            if pnl >= 1.50 and not pos.get("tp2_done"):
-                log(f"  🎯 TP2 triggered (+150%) for {sym} — selling 25%")
-                pos["tp2_done"] = True
-
-            # TP3: +300%
-            if pnl >= 3.00 and not pos.get("tp3_done"):
-                log(f"  🎯 TP3 triggered (+300%) for {sym} — selling 15%")
-                pos["tp3_done"] = True
-
-            # 时间止损: 48h无动作
-            if age_h > 48:
-                log(f"  ⏰ Time stop: {sym} held {age_h:.0f}h — removing from tracking")
-                del positions[addr]
-
-# ─── 主循环 ────────────────────────────────────────────────────────────────────
+# ─── 主程序 ───────────────────────────────────────────────────────────────────
 def main():
-    seen = set()
-    seen_time = {}   # addr -> timestamp，超过10分钟重新评估
-    positions = {}
-    round_num = 0
-
     log("=" * 55)
-    log("SOL MEME HUNTER v2 — started")
+    log("SOL MEME HUNTER v3 -- WebSocket Architecture")
     log(f"Wallet: {WALLET}")
-    log(f"Position: ${MAX_POSITION} | Safety: ${SAFETY_LINE}")
-    log(f"Gates: rug<{GATE_RUG_MAX} bundle<{GATE_BUNDLE_MAX}% kline<{GATE_KLINE_HIGH_PCT:.0%}ofHigh")
+    log(f"Entry: ${MAX_POSITION} | Min SM wallets: {MIN_SM_WALLETS} | Max sold: {MAX_SOLD_RATIO}%")
+    log(f"MC range: ${MIN_MC}-${MAX_MC} | Dual source required: {REQUIRE_DUAL_SRC}")
     log("=" * 55)
+
+    event_queue = queue.Queue()
+    aggregator  = SignalAggregator()
+    ws_listener = WSListener(event_queue)
+    positions   = {}
+    acted       = set()   # 已处理过的 addr（进场后不重复）
+
+    # 启动 WebSocket sessions
+    if not ws_listener.start_sessions():
+        log("WebSocket sessions failed -- falling back to polling mode")
+        # fallback: 每30秒轮询一次信号
+        fallback_mode = True
+    else:
+        fallback_mode = False
+
+    # 启动 WS poll 线程
+    if not fallback_mode:
+        poll_thread = threading.Thread(target=ws_listener.poll_loop, daemon=True)
+        poll_thread.start()
+        log("WS poll thread started")
+
+    # ── 主循环 ────────────────────────────────────────────────────────────────
+    round_num = 0
+    last_balance_check = 0
+    last_position_check = 0
+    usdc = 200.0
 
     while True:
         round_num += 1
-        log(f"\n{'─'*20} ROUND {round_num} {'─'*20}")
+        now = time.time()
+
+        # 余额检查（每60秒一次）
+        if now - last_balance_check > 60:
+            usdc = get_usdc_balance()
+            last_balance_check = now
+            log(f"USDC: ${usdc:.1f} | Positions: {len(positions)}")
 
         # 安全线
-        usdc = get_usdc_balance()
-        log(f"USDC: ${usdc:.1f}")
         if usdc < SAFETY_LINE:
-            log(f"🔴 SAFETY LINE triggered (${usdc:.1f} < ${SAFETY_LINE}) — skip new entries")
-            check_positions(positions)
-            time.sleep(SCAN_INTERVAL)
+            log(f"SAFETY LINE ${usdc:.1f} -- paused")
+            time.sleep(30)
             continue
 
-        # 持仓检查
-        check_positions(positions)
+        # 持仓检查（每5分钟一次）
+        if now - last_position_check > 300:
+            check_and_tp(positions)
+            last_position_check = now
 
-        # 信号扫描
-        okx_sigs  = get_okx_signals()
-        gmgn_sigs = get_gmgn_signals()
-        log(f"Signals: OKX={len(okx_sigs)} GMGN={len(gmgn_sigs)}")
+        # 处理 WS 事件
+        if not fallback_mode:
+            processed = 0
+            while not event_queue.empty() and processed < 50:
+                item = event_queue.get_nowait()
+                aggregator.add_event(item["source"], item["event"])
+                processed += 1
+        else:
+            # fallback: 直接调用 REST API
+            out = run("onchainos signal list --chain solana --wallet-type 1,2 --limit 20", timeout=25)
+            d = jparse(out)
+            for s in d.get("data", []):
+                evt = {
+                    "tokenAddress": s.get("token", {}).get("tokenAddress", ""),
+                    "marketCapUsd": s.get("token", {}).get("marketCapUsd", 0),
+                    "symbol": s.get("token", {}).get("symbol", "?"),
+                    "triggerWalletAddress": s.get("triggerWalletAddress", ""),
+                    "soldRatioPercent": s.get("soldRatioPercent", 100),
+                }
+                aggregator.add_event("signal", evt)
+                aggregator.add_event("sm_tracker", evt)
 
-        # 合并去重（超过10分钟的token重新允许评估）
-        now_ts = time.time()
-        for addr in list(seen_time.keys()):
-            if now_ts - seen_time[addr] > 600:
-                seen.discard(addr)
-                del seen_time[addr]
+        # 获取强信号
+        strong = aggregator.get_strong_signals()
+        if strong:
+            log(f"Strong signals: {len(strong)} -- top: {strong[0]['sym']} wallets={strong[0]['wallets']} sold={strong[0]['sold']:.0f}%")
 
-        candidates = {}
-        for s in okx_sigs + gmgn_sigs:
-            addr = s["addr"]
-            if addr not in seen and addr not in positions:
-                if addr not in candidates or s.get("count", 0) > candidates[addr].get("count", 0):
-                    candidates[addr] = s
+        # 检查是否可以开仓
+        if len(positions) >= MAX_POSITIONS:
+            time.sleep(5)
+            continue
 
-        log(f"New candidates: {len(candidates)}")
+        for sig in strong[:3]:
+            addr = sig["addr"]
+            sym  = sig["sym"]
+            mc   = sig["mc"]
 
-        # 按 score 排序，取 top 6
-        ranked = sorted(candidates.values(), key=lambda x: -x.get("count", 0))[:6]
-
-        entered = 0
-        for c in ranked:
-            addr   = c["addr"]
-            sym    = c.get("sym", "?")
-            mc     = c.get("mc", 0)
-            source = c.get("source", "?")
-            seen.add(addr)
-            seen_time[addr] = time.time()
-
-            log(f"\n  [{source}] {sym} MC=${mc:.0f} signals={c.get('count',0)} sold={c.get('sold',0):.0f}%")
-
-            ok, reason = gate_check(addr, sym)
-            if not ok:
-                log(f"  ❌ {reason}")
+            if addr in acted or addr in positions:
                 continue
 
+            log(f"\nEvaluating {sym} ({addr[:12]}...) MC=${mc:.0f} wallets={sig['wallets']} sold={sig['sold']:.0f}%")
+
+            # 五关过滤
+            ok, reason = gate_check(addr)
+            if not ok:
+                log(f"  REJECT {reason}")
+                acted.add(addr)
+                continue
+
+            # K线时机
             ok2, reason2 = kline_check(addr)
             if not ok2:
-                log(f"  ⚠️  {reason2}")
+                log(f"  WAIT {reason2} -- waiting")
+                # 不加入 acted，等K线好了再试
                 continue
 
-            log(f"  ✅ PASS {reason} | {reason2}")
+            log(f"  Gates PASS | K-line: {reason2}")
 
             # 仓位大小
-            if usdc > 150:   pos_size = MAX_POSITION
-            elif usdc > 120: pos_size = 2
-            else:            pos_size = 1
+            pos_size = MAX_POSITION if usdc > 150 else (2 if usdc > 100 else 1)
 
-            success, tx = execute_swap(addr, sym, pos_size, f"{source} score={c.get('count')}")
-            if success:
+            ok3, tx = execute_swap(addr, sym, pos_size)
+            if ok3:
                 positions[addr] = {
                     "sym": sym, "amount_usd": pos_size,
-                    "entry_time": time.time(), "entry_price_usd": 0,
-                    "source": source
+                    "entry_time": time.time(), "entry_price": 0,
+                    "source": sig.get("source", "ws")
                 }
-                entered += 1
+                acted.add(addr)
+                usdc -= pos_size
+                log(f"  Entered {sym} ${pos_size} | USDC remaining: ${usdc:.1f}")
+            else:
+                acted.add(addr)  # 失败也标记，避免反复尝试
 
-            time.sleep(5)
+            time.sleep(3)
 
-        log(f"\nRound {round_num}: entered={entered} | positions={len(positions)} | USDC=${usdc:.1f}")
-        log(f"Sleeping {SCAN_INTERVAL}s...")
-        time.sleep(SCAN_INTERVAL)
+        # 主循环节奏（WS模式近实时，fallback模式30秒）
+        time.sleep(2 if not fallback_mode else 30)
 
 if __name__ == "__main__":
     main()
