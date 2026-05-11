@@ -464,91 +464,56 @@ def get_usdc_balance():
 # ─── 持仓管理 ─────────────────────────────────────────────────────────────────
 def check_and_tp(positions):
     """
-    止盈策略：宁可少赚，不能犯错
-    +50% → 卖75%，留25%底仓
-    +150% → 再卖底仓的50%（此时已是纯利润）
-    +300% → 卖剩余的50%，只留极少底仓飞
-    止损：-40% 且聪明钱出货 → 清仓
-    超时：持仓>48h 无动作 → 清仓
+    持仓监控：只记录盈亏状态，不自动执行止盈止损
+    人工根据日志决定是否手动操作
     """
     if not positions:
         return
-    log(f"Checking {len(positions)} positions...")
+    log(f"=== 持仓检查 ({len(positions)}个) ===")
     for addr, pos in list(positions.items()):
-        sym        = pos["sym"]
-        entry      = pos.get("entry_price", 0)
-        amount_usd = pos.get("amount_usd", 0)
-        if not entry or not amount_usd:
-            continue
+        sym       = pos["sym"]
+        entry     = pos.get("entry_price", 0)
+        amt_usd   = pos.get("amount_usd", 0)
+        age_h     = (time.time() - pos["entry_time"]) / 3600
+        src       = pos.get("source", "?")
 
         out = run(f"onchainos token price-info --address {addr} --chain solana", timeout=15)
         d   = jparse(out)
         cur = sf(d.get("data", {}).get("price"))
-        if not cur:
-            continue
 
-        pnl   = (cur - entry) / entry
-        age_h = (time.time() - pos["entry_time"]) / 3600
-        log(f"  {sym}: PnL={pnl:+.1%} age={age_h:.1f}h entry=${entry:.8f} cur=${cur:.8f}")
+        if entry > 0 and cur > 0:
+            pnl     = (cur - entry) / entry
+            pnl_usd = amt_usd * pnl
+            cur_val = amt_usd * (1 + pnl)
 
-        # TP1：+50% → 卖75%，留25%底仓（宁可少赚，保住利润）
-        if pnl >= 0.50 and not pos.get("tp1"):
-            sell_amt = amount_usd * 0.75
-            log(f"  🎯 TP1 +50% {sym} — sell 75% (${sell_amt:.1f}), keep 25% floor")
-            ok, tx = execute_swap(addr, sym + "_SELL", sell_amt)
-            if ok:
-                pos["tp1"]        = True
-                pos["amount_usd"] = amount_usd * 0.25
-                log(f"  TP1 done, floor=${pos['amount_usd']:.1f}U")
+            # 状态标签
+            if pnl >= 3.0:   tag = "🚀 +300%+"
+            elif pnl >= 1.5: tag = "🎯 +150%+"
+            elif pnl >= 0.5: tag = "✅ +50%+"
+            elif pnl >= 0.0: tag = "📈 盈利"
+            elif pnl >= -0.4: tag = "⚠️ 亏损"
+            else:             tag = "🛑 -40%+"
 
-        # TP2：+150% → 再卖底仓50%（此时已是纯利润在飞）
-        elif pnl >= 1.50 and pos.get("tp1") and not pos.get("tp2"):
-            sell_amt = pos["amount_usd"] * 0.50
-            log(f"  🎯 TP2 +150% {sym} — sell 50% of floor (${sell_amt:.1f})")
-            ok, tx = execute_swap(addr, sym + "_SELL", sell_amt)
-            if ok:
-                pos["tp2"]        = True
-                pos["amount_usd"] = pos["amount_usd"] * 0.50
-                log(f"  TP2 done, floor=${pos['amount_usd']:.1f}U")
+            log(f"  {tag} {sym}: 入场${amt_usd:.1f} → 现值${cur_val:.2f} PnL={pnl:+.1%}(${pnl_usd:+.2f}) age={age_h:.1f}h [{src}]")
 
-        # TP3：+300% → 卖剩余50%，只留极少底仓
-        elif pnl >= 3.00 and pos.get("tp2") and not pos.get("tp3"):
-            sell_amt = pos["amount_usd"] * 0.50
-            log(f"  🎯 TP3 +300% {sym} — sell 50% of remaining (${sell_amt:.1f})")
-            ok, tx = execute_swap(addr, sym + "_SELL", sell_amt)
-            if ok:
-                pos["tp3"]        = True
-                pos["amount_usd"] = pos["amount_usd"] * 0.50
-                log(f"  TP3 done, moonbag=${pos['amount_usd']:.1f}U")
-
-        # 止损：-40% 且 SM 出货 → 清仓
-        elif pnl <= -0.40 and not pos.get("tp1"):
-            log(f"  🛑 Stop loss {sym} PnL={pnl:+.1%} — checking SM exit...")
-            out5 = run(
-                f"gmgn-cli token traders --chain sol --address {addr} "
-                f"--tag smart_degen --order-by sell_volume_cur --direction desc --limit 5 --raw",
-                timeout=20
-            )
-            d5 = jparse(out5)
-            traders = d5.get("list", [])
-            if traders:
-                top = traders[0]
-                sv = sf(top.get("sell_volume_cur"))
-                bv = sf(top.get("buy_volume_cur"))
-                if bv > 0 and sv > bv * 1.3:
-                    log(f"  🛑 SM exiting confirmed, closing {sym}")
-                    del positions[addr]
-                    break
-                else:
-                    log(f"  SM not exiting (sv=${sv:.0f} bv=${bv:.0f}), holding")
-            else:
-                log(f"  No SM data, holding despite loss")
-
-        # 超时止损：48h 无动作
-        if age_h > 48 and addr in positions:
-            log(f"  ⏰ Time stop {sym} ({age_h:.0f}h)")
-            del positions[addr]
-            break
+            # 提醒（不执行）
+            if pnl >= 0.50 and not pos.get("tp1_alerted"):
+                log(f"  ⚡ 提醒: {sym} 已达 +50% 止盈线，建议手动卖出75%")
+                pos["tp1_alerted"] = True
+            if pnl >= 1.50 and not pos.get("tp2_alerted"):
+                log(f"  ⚡ 提醒: {sym} 已达 +150% 止盈线，建议手动再卖50%底仓")
+                pos["tp2_alerted"] = True
+            if pnl >= 3.00 and not pos.get("tp3_alerted"):
+                log(f"  ⚡ 提醒: {sym} 已达 +300% 止盈线，建议手动再卖50%")
+                pos["tp3_alerted"] = True
+            if pnl <= -0.40 and not pos.get("sl_alerted"):
+                log(f"  ⚡ 提醒: {sym} 已达 -40% 止损线，建议手动检查是否清仓")
+                pos["sl_alerted"] = True
+            if age_h > 48 and not pos.get("timeout_alerted"):
+                log(f"  ⚡ 提醒: {sym} 持仓超48h，建议手动评估是否清仓")
+                pos["timeout_alerted"] = True
+        else:
+            log(f"  ❓ {sym}: 无法获取价格 age={age_h:.1f}h [{src}]")
 
 # ─── 主程序 ────────────────────────────────────────────────────────────────────
 def main():
@@ -558,7 +523,7 @@ def main():
     log(f"Day safety: ${SAFETY_LINE} | Night safety: ${SAFETY_LINE_NIGHT}")
     log(f"Signal: inflowUsd>${OKX_INFLOW_MIN} + risk<={OKX_RISK_MAX} + SM>={MIN_SM_WALLETS} + soldRatio<{MAX_SOLD_RATIO}%")
     log(f"MC: ${MIN_MC}-${MAX_MC} | liq: ${MIN_LIQ}-${MAX_LIQ} | top10<{MAX_TOP10:.0%} | DEV_MUST_CLOSE: {DEV_MUST_CLOSE}")
-    log(f"TP: +50%→sell75% | +150%→sell50%floor | +300%→sell50%remain | SL: -40%+SM_exit")
+    log(f"止盈止损: 仅监控提醒，不自动执行，需手动操作")
     log("=" * 60)
 
     event_queue = queue.Queue()
