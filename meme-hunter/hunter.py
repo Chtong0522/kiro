@@ -240,7 +240,15 @@ def get_token_price(addr):
     """查询 token 当前价格，返回 float 或 0"""
     out = run(f"onchainos token price-info --address {addr} --chain solana", timeout=15)
     d = jparse(out)
-    return sf(d.get("data", {}).get("price"))
+    data = d.get("data", {})
+    # API 可能返回 dict 或 list
+    if isinstance(data, list):
+        if data:
+            return sf(data[0].get("price", 0))
+        return 0.0
+    if isinstance(data, dict):
+        return sf(data.get("price", 0))
+    return 0.0
 
 
 def load_existing_positions():
