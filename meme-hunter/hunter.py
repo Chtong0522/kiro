@@ -29,6 +29,7 @@ WALLET    = "AXBCfbioEHiJ48ejNp5feEzWt2iHFLUDNMk27t5vXWLE"
 USDC_ADDR = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 LOG_FILE  = "/tmp/meme_hunter_v4.log"
 ACTED_FILE = "/tmp/meme_hunter_acted.json"
+SESSION_FILE = "/tmp/meme_hunter_session.json"
 
 # 安全熔断
 SAFETY_LINE_DAY   = 80
@@ -75,7 +76,8 @@ TRAIL_DISTANCE_A = 0.12   # 12% drawdown from peak after TP1 → exit Tier A
 TRAIL_DISTANCE_B = 0.10   # 10% drawdown from peak after TP1 → exit Tier B
 
 # 时间衰减止损：持仓时间过长但未达硬止损时提前离场
-TIME_DECAY_SL = [(30, -0.08), (60, -0.05)]  # (minutes_held, pnl_threshold)
+# Fix 2: 60min threshold must be less negative (stricter) than 30min — exit if still underwater at all
+TIME_DECAY_SL = [(30, -0.08), (60, -0.01)]  # (minutes_held, pnl_threshold)
 
 # 会话连续亏损熔断
 SESSION_CONSEC_LOSS_MAX = 3
@@ -88,6 +90,30 @@ cooldown_until: dict = {}
 
 # 会话连续亏损状态
 session_state = {'consecutive_losses': 0, 'pause_until': 0.0}
+
+
+def load_session_state():
+    """加载 session_state，如文件不存在则返回默认值"""
+    try:
+        if os.path.exists(SESSION_FILE):
+            with open(SESSION_FILE, "r") as f:
+                data = json.load(f)
+            # Reset pause_until if it already expired (don't re-apply stale pauses)
+            if data.get('pause_until', 0) < time.time():
+                data['pause_until'] = 0.0
+            return data
+    except Exception:
+        pass
+    return {'consecutive_losses': 0, 'pause_until': 0.0}
+
+
+def save_session_state():
+    """保存 session_state 到磁盘"""
+    try:
+        with open(SESSION_FILE, "w") as f:
+            json.dump(session_state, f)
+    except Exception:
+        pass
 
 
 # ─── 工具函数 ────────────────────────────────────────────────────────────────
@@ -380,8 +406,8 @@ def fetch_sm_activities(sm_buys):
         if sym != "?":
             entry["sym"] = sym
 
-    # 清理超过 1 小时的条目
-    stale = [a for a, e in sm_buys.items() if now - e["first_seen"] > 3600]
+    # 清理超过 1 小时的条目 (Fix 4: use last_seen not first_seen for staleness)
+    stale = [a for a, e in sm_buys.items() if now - e["last_seen"] > 3600]
     for a in stale:
         del sm_buys[a]
 
@@ -467,7 +493,8 @@ def check_k1_pump(addr, sym="?"):
             log(f"  K1_PUMP_GUARD: skip {sym} 1m={pct:.1%}")
             return True
         return False
-    except Exception:
+    except Exception as e:
+        log(f"  WARN check_k1_pump: {e} (fail-open)")
         return False
 
 
@@ -491,7 +518,8 @@ def check_top_zone(addr, cur_price, sym="?"):
             log(f"  TOP_ZONE: {sym} at {pct:.0%} of 1h high")
             return True
         return False
-    except Exception:
+    except Exception as e:
+        log(f"  WARN check_top_zone: {e} (fail-open)")
         return False
 
 
@@ -629,6 +657,7 @@ def security_check(addr):
     d = jparse(out)
     items = d.get("data", [])
     if not items:
+        log(f"  WARN security_check: no data for {addr[:12]}, passing (fail-open)")
         return True, "PASS (no data)"
     r = items[0] if isinstance(items, list) else items
     if r.get("isHoneypot"):
@@ -655,6 +684,7 @@ def check_sm_exiting(addr):
     d = jparse(out)
     traders = d.get("list", [])
     if not traders:
+        log(f"  WARN: check_sm_exiting returned empty traders for {addr} — treating as not-exiting")
         return False
     top = traders[0]
     sv = sf(top.get("sell_volume_cur"))
@@ -733,6 +763,7 @@ def _record_sell_outcome(pnl_usd, addr):
             log(f"  SESSION_PAUSE: {SESSION_CONSEC_LOSS_MAX} consecutive losses, pausing {SESSION_CONSEC_PAUSE//60}min")
     else:
         session_state['consecutive_losses'] = 0
+    save_session_state()
 
 def check_positions(positions, daily_state):
     """
@@ -767,13 +798,13 @@ def check_positions(positions, daily_state):
         if not cur:
             pos['zero_price_count'] = pos.get('zero_price_count', 0) + 1
             n = pos['zero_price_count']
-            log(f"  price_zero [{n}/3] {sym}")
-            if n < 3:
-                # Not yet confirmed zero — only act on Tier C timeout after 3 confirms
+            log(f"  price_zero [{n}/10] {sym}")
+            if n < 10:
+                # Not yet confirmed zero — only act on Tier C timeout after 10 confirms
                 if ("C" in tier) and age_min > 3 and not pos.get("timeout_done"):
-                    log(f"  timeout Tier C {sym} ({age_min:.1f}min) — no price data (waiting {n}/3)")
+                    log(f"  timeout Tier C {sym} ({age_min:.1f}min) — no price data (waiting {n}/10)")
                 continue
-            # zero_price_count >= 3: proceed with emergency action
+            # zero_price_count >= 10: proceed with emergency action
             if ("C" in tier) and age_min > 3 and not pos.get("timeout_done"):
                 log(f"  timeout Tier C {sym} ({age_min:.1f}min) — no price data")
                 ok, _ = sell_token(addr, sym, amt_tokens, "Tier_C_timeout_no_price")
@@ -788,7 +819,7 @@ def check_positions(positions, daily_state):
                         log(f"  Tier C 连续亏损 2 次，冷却 {TIER_C_COOLDOWN/3600:.0f}h")
                     del positions[addr]
             else:
-                log(f"  ? {tier} {sym}: no price data (3+ zeros) age={age_h:.1f}h")
+                log(f"  ? {tier} {sym}: no price data (10+ zeros) age={age_h:.1f}h")
             continue
 
         # Price obtained — reset zero counter
@@ -815,6 +846,7 @@ def check_positions(positions, daily_state):
         )
 
         # ── FAST_DUMP (highest priority) ────────────────────────────────────
+        # Fix 3: continue only on success; fall through to LIQ check on failure
         if peak > 0 and (peak - cur) / peak >= 0.15 and cur < entry:
             drop = (peak - cur) / peak
             log(f"  FAST_DUMP {sym}: peak=${peak:.6f} cur=${cur:.6f} drop={drop:.1%}")
@@ -828,9 +860,12 @@ def check_positions(positions, daily_state):
                     if daily_state["tier_c_consecutive_losses"] >= 2:
                         daily_state["tier_c_pause_until"] = time.time() + TIER_C_COOLDOWN
                 del positions[addr]
-            continue
+                continue
+            # sell failed: log and fall through to LIQ_EMERGENCY
+            log(f"  FAST_DUMP sell failed for {sym}, falling through to LIQ check")
 
         # ── Liquidity Emergency Exit (every 5 min per position) ─────────────
+        # Fix 3: continue only on success; fall through to time-decay checks on failure
         if now - pos.get('last_liq_check', 0) > 300:
             pos['last_liq_check'] = now
             try:
@@ -851,7 +886,9 @@ def check_positions(positions, daily_state):
                         add_realized_pnl(daily_state, realized)
                         _record_sell_outcome(realized, addr)
                         del positions[addr]
-                    continue
+                        continue
+                    # sell failed: log and fall through to tier-dispatch checks
+                    log(f"  LIQ_EMERGENCY sell failed for {sym}, falling through to tier checks")
             except Exception:
                 pass  # fail-open
 
@@ -972,8 +1009,6 @@ def check_positions(positions, daily_state):
                     pos["timeout_done"] = True
                     del positions[addr]
                 continue
-
-        # ── Tier B TP/SL ─────────────────────────────────────────────────────
         elif "B" in tier:
             # TP1: +40% → 卖 70%
             if pnl_pct >= 0.40 and not pos.get("tp1_done"):
@@ -1114,10 +1149,13 @@ def main():
 
     usdc = 200.0
 
-    # 持仓接管 + acted 加载
+    # 持仓接管 + acted 加载 + session state 恢复
     positions = load_existing_positions()
     acted     = load_acted()
     acted.update({addr: time.time() for addr in positions})
+    # Fix 11: restore session state across restarts
+    saved_session = load_session_state()
+    session_state.update(saved_session)
     save_acted(acted)
 
     log("=" * 60)
@@ -1188,7 +1226,7 @@ def main():
                 if strength == "NORMAL":
                     inflow = get_hot_inflow(hot_cache, addr)
                     if inflow <= 500:
-                        log(f"  SKIP Tier A NORMAL {sym}: inflow=${inflow:.0f} <= 500")
+                        log(f"  SKIP Tier A NORMAL {sym}: not in hot-50 (inflow=${inflow:.0f} <= 500)")
                         continue
                 # v5.1: Confidence scoring
                 confidence = min(90, n_wallets * 30)
@@ -1217,8 +1255,16 @@ def main():
                 log(f"ENTER TIER_A {sym} ${size} | MC=${mc:.0f} | {strength} {n_wallets}w | conf={confidence}")
                 ok_swap, _ = execute_swap(USDC_ADDR, addr, size)
                 if ok_swap:
-                    entry_price = get_token_price(addr)
-                    amt_tokens  = (size / entry_price) if entry_price > 0 else 0
+                    entry_price = 0
+                    for _try in range(3):
+                        entry_price = get_token_price(addr)
+                        if entry_price > 0:
+                            break
+                        time.sleep(2)
+                    if entry_price <= 0:
+                        log(f"  WARN: {sym} price=0 after 3 retries, using sentinel 1e-18")
+                        entry_price = 1e-18
+                    amt_tokens = size / entry_price
                     positions[addr] = {
                         "sym":           sym,
                         "amount_usd":    size,
@@ -1272,11 +1318,23 @@ def main():
                     acted[addr] = time.time()
                     save_acted(acted)
                     continue
+                # v5.2: K1 pump guard for Tier B too
+                if check_k1_pump(addr, sym):
+                    log(f"  SKIP Tier B {sym}: K1 pump guard")
+                    continue
                 log(f"ENTER TIER_B {sym} ${size} | MC=${mc:.0f} | bonding={bonding:.1f}%")
                 ok_swap, _ = execute_swap(USDC_ADDR, addr, size)
                 if ok_swap:
-                    entry_price = get_token_price(addr)
-                    amt_tokens  = (size / entry_price) if entry_price > 0 else 0
+                    entry_price = 0
+                    for _try in range(3):
+                        entry_price = get_token_price(addr)
+                        if entry_price > 0:
+                            break
+                        time.sleep(2)
+                    if entry_price <= 0:
+                        log(f"  WARN: {sym} price=0 after 3 retries, using sentinel 1e-18")
+                        entry_price = 1e-18
+                    amt_tokens = size / entry_price
                     positions[addr] = {
                         "sym":           sym,
                         "amount_usd":    size,
@@ -1338,8 +1396,16 @@ def main():
                 log(f"ENTER TIER_C {sym} ${size} | MC=${mc:.0f} | bonding={bonding:.1f}% | holders={holders}")
                 ok_swap, _ = execute_swap(USDC_ADDR, addr, size)
                 if ok_swap:
-                    entry_price = get_token_price(addr)
-                    amt_tokens  = (size / entry_price) if entry_price > 0 else 0
+                    entry_price = 0
+                    for _try in range(3):
+                        entry_price = get_token_price(addr)
+                        if entry_price > 0:
+                            break
+                        time.sleep(2)
+                    if entry_price <= 0:
+                        log(f"  WARN: {sym} price=0 after 3 retries, using sentinel 1e-18")
+                        entry_price = 1e-18
+                    amt_tokens = size / entry_price
                     positions[addr] = {
                         "sym":             sym,
                         "amount_usd":      size,
