@@ -34,7 +34,7 @@ SESSION_FILE = "/tmp/meme_hunter_session.json"
 # 安全熔断
 SAFETY_LINE_DAY   = 80
 SAFETY_LINE_NIGHT = 150
-DAILY_LOSS_LIMIT  = 15
+DAILY_LOSS_LIMIT  = 15   # 触发后需重启才能恢复（不会自动日重置）
 MAX_POSITIONS     = 6
 MAX_TIER_C_DAY    = 4
 TIER_C_COOLDOWN   = 7200  # 2小时冷却（连续2次亏损后）
@@ -291,7 +291,7 @@ def load_existing_positions():
 # ─── 每日 PnL 状态 ────────────────────────────────────────────────────────────
 
 def reset_daily_if_needed(daily_state):
-    """检查 UTC 日期，新的一天则重置 daily_state"""
+    """检查 UTC 日期，新的一天则重置 daily_state（注意：halted 标志不重置，需重启清除）"""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if daily_state["date"] != today:
         log(f"  新的一天 {today}，重置 daily_state（昨日 PnL={daily_state['realized_pnl']:+.2f}）")
@@ -300,6 +300,7 @@ def reset_daily_if_needed(daily_state):
         daily_state["tier_c_count"] = 0
         daily_state["tier_c_consecutive_losses"] = 0
         daily_state["tier_c_pause_until"] = 0.0
+        # halted 标志不重置 — 需要人工重启脚本才能恢复
 
 
 def add_realized_pnl(daily_state, pnl_usd):
@@ -733,8 +734,8 @@ def entry_guard(positions, daily_state, usdc, tier, addr=None):
         return False, f"safety_line ${usdc:.1f}<${safety}"
     if len(positions) >= MAX_POSITIONS:
         return False, f"max_positions {len(positions)}/{MAX_POSITIONS}"
-    if daily_state["realized_pnl"] < -DAILY_LOSS_LIMIT:
-        return False, f"daily_loss_limit ${daily_state['realized_pnl']:.2f}"
+    if daily_state.get("halted") or daily_state["realized_pnl"] < -DAILY_LOSS_LIMIT:
+        return False, f"halted/daily_loss_limit ${daily_state['realized_pnl']:.2f}"
 
     tier_upper = tier.upper() if isinstance(tier, str) else ""
 
@@ -1174,7 +1175,7 @@ def main():
     save_acted(acted)
 
     log("=" * 60)
-    log("SOL MEME HUNTER v5.1 — 三层预测架构 + 12 策略强化")
+    log("SOL MEME HUNTER v5.2 — 三层预测架构 + 日亏损重启熔断")
     log(f"Wallet: {WALLET}")
     log(f"Safety  DAY=${SAFETY_LINE_DAY}  NIGHT=${SAFETY_LINE_NIGHT}  DAILY_LOSS_LIMIT=${DAILY_LOSS_LIMIT}")
     log(f"Tier A size={TIER_A_SIZE}(night={TIER_A_NIGHT})  MC ${SM_MIN_MC}-${SM_MAX_MC}  liq ${SM_MIN_LIQ}-${SM_MAX_LIQ}")
@@ -1210,9 +1211,12 @@ def main():
             time.sleep(10)
             continue
 
-        # 每日亏损熔断
-        if daily_state["realized_pnl"] < -DAILY_LOSS_LIMIT:
-            log(f"DAILY LOSS LIMIT: ${daily_state['realized_pnl']:.2f} — paused for today")
+        # 每日亏损熔断 — 触发后需重启才能恢复（不自动日重置）
+        if daily_state.get("halted") or daily_state["realized_pnl"] < -DAILY_LOSS_LIMIT:
+            if not daily_state.get("halted"):
+                daily_state["halted"] = True
+                log(f"🚨 DAILY LOSS LIMIT HIT: ${daily_state['realized_pnl']:.2f} — 需重启脚本才能恢复交易")
+            log(f"HALTED: 日亏损熔断，请重启脚本恢复 | PnL=${daily_state['realized_pnl']:.2f}")
             time.sleep(60)
             continue
 
