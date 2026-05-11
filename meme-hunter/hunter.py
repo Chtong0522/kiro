@@ -62,10 +62,13 @@ TIER_B_MIN_MC  = 30000   # MC 至少 $30k，过滤极小垃圾币
 TIER_B_MIN_HOLDERS = 50  # 至少 50 个持有人，说明有真实社区
 TIER_B_MIN_APED    = 2   # 至少 2 个 OKX 用户跟单（提高置信度）
 
-# Tier C 过滤（NEW 机器人触发）
+# Tier C 过滤（NEW 机器人触发）— 严格条件，宁缺毋滥
 MIN_BONDING_C   = 3
 MAX_BONDING_C   = 10
-MAX_TOKEN_AGE_C = 5   # 最多 5 分钟
+MAX_TOKEN_AGE_C = 3    # 最多 3 分钟（更严格的时间窗口）
+TIER_C_MIN_MC        = 8000   # MC 至少 $8000（更高门槛）
+TIER_C_MIN_HOLDERS   = 15     # 至少 15 个持币地址（2个根本不够）
+TIER_C_MIN_BUY_TX    = 10     # 至少 10 笔买单（有真实买盘）
 
 # 刷新间隔（秒）
 HOT_REFRESH       = 300
@@ -649,11 +652,11 @@ def fetch_new_tokens():
             continue
         if dev_hold != 0:
             continue
-        if mc < 3000:   # MC 至少 $3000，过滤极小垃圾币
+        if mc < TIER_C_MIN_MC:
             continue
-        if holders < 2:
+        if holders < TIER_C_MIN_HOLDERS:
             continue
-        if buy_tx <= 5:
+        if buy_tx < TIER_C_MIN_BUY_TX:
             continue
 
         t["tokenAddress"] = addr
