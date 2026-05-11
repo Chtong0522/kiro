@@ -54,10 +54,13 @@ SM_MAX_LIQ   = 200000
 SM_WINDOW    = 600   # 10 分钟内多钱包信号视为强信号
 
 # Tier B 过滤（MIGRATING 毕业伏击）
-MIN_BONDING  = 70
-MAX_BONDING  = 97
-MAX_INSIDERS = 30
-MAX_TOP10_B  = 40
+MIN_BONDING    = 70
+MAX_BONDING    = 97
+MAX_INSIDERS   = 30
+MAX_TOP10_B    = 40
+TIER_B_MIN_MC  = 30000   # MC 至少 $30k，过滤极小垃圾币
+TIER_B_MIN_HOLDERS = 50  # 至少 50 个持有人，说明有真实社区
+TIER_B_MIN_APED    = 2   # 至少 2 个 OKX 用户跟单（提高置信度）
 
 # Tier C 过滤（NEW 机器人触发）
 MIN_BONDING_C   = 3
@@ -585,7 +588,12 @@ def fetch_migrating_tokens():
             continue
         if top10 >= MAX_TOP10_B:
             continue
-        if aped < 1:
+        if aped < TIER_B_MIN_APED:
+            continue
+        if mc < TIER_B_MIN_MC:
+            continue
+        holders = int(sf(t.get("tags", {}).get("totalHolders", 0)))
+        if holders < TIER_B_MIN_HOLDERS:
             continue
         if not has_social:
             continue
