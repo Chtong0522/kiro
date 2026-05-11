@@ -24,8 +24,8 @@ MAX_POSITIONS  = 6
 # 验证数据：inflowUsd>0 涨组100% vs 跌组0%
 OKX_INFLOW_MIN    = 1000   # hot-tokens inflowUsd 最低 $1000（净买入确认）
 OKX_RISK_MAX      = 1      # riskLevelControl <= 1（OKX官方低风险认证）
-MIN_SM_WALLETS    = 3      # signal list 最少3个SM钱包触发
-MAX_SOLD_RATIO    = 50     # soldRatioPercent < 50%
+MIN_SM_WALLETS    = 1      # fallback 模式每 token 只出现一次，count=1
+MAX_SOLD_RATIO    = 85     # 放宽（signal list 普遍 60-95%，聪明钱陆续出是正常的）
 MIN_MC            = 50000  # 最小市值 $50k（OKX战场现实MC门槛）
 MAX_MC            = 5000000 # 最大市值 $5M
 MAX_BUNDLE        = 50     # bundle不是淘汰条件，仅过滤极端情况
@@ -125,6 +125,34 @@ def get_hot_tokens_inflow():
     _hot_tokens_ts = now
     log(f"  hot-tokens refreshed: {len(result)} tokens")
     return result
+
+def get_hot_token_candidates(hot_data):
+    """路径A：直接从 hot-tokens 找候选，不依赖 signal list"""
+    candidates = []
+    for addr, info in hot_data.items():
+        inflow = info.get('inflow', 0)
+        change = info.get('change', 0)
+        top10  = info.get('top10', 100)
+        mc     = info.get('mc', 0)
+        risk   = info.get('risk', 99)
+        sym    = info.get('sym', '?')
+        liq    = info.get('liq', 0)
+
+        if inflow < 1000: continue
+        if change < 5: continue
+        if top10 > 40: continue
+        if not (30000 < mc < 5000000): continue
+        if risk > 1: continue
+        if liq < 5000: continue
+
+        candidates.append({
+            'addr': addr, 'sym': sym, 'mc': mc,
+            'inflow': inflow, 'change': change,
+            'source': 'hot_inflow',
+            'score': inflow / 1000 + change / 10
+        })
+    return sorted(candidates, key=lambda x: -x['score'])
+
 
 # ─── WebSocket 监听 ────────────────────────────────────────────────────────────
 class WSListener:
@@ -269,7 +297,7 @@ class SignalAggregator:
         return set(ws.split(",")) if ws else set()
 
 # ─── OKX专属五关过滤 ──────────────────────────────────────────────────────────
-def gate_check(addr, hot_data=None):
+def gate_check(addr, hot_data=None, source='signal'):
     """
     OKX战场过滤器：
     Gate 0: OKX inflowUsd > 0（新增，OKX独有的最强信号）
@@ -277,6 +305,9 @@ def gate_check(addr, hot_data=None):
     Gate 2: dev行为 + top10 + creator_close
     Gate 3: bundle
     Gate 5: SM出货检测
+
+    source='hot_inflow' 路径A：Gate0已由候选筛过，DEV_MUST_CLOSE 仍强制
+    source='signal'     路径B：DEV_MUST_CLOSE 放宽为仅记录日志
     """
     # Gate 0: OKX inflowUsd 检查（OKX战场核心信号）
     if hot_data and addr in hot_data:
@@ -312,8 +343,11 @@ def gate_check(addr, hot_data=None):
         if sf(d2.get("top_10_holder_rate")) > MAX_TOP10:
             return False, f"G2:top10={d2.get('top_10_holder_rate')}"
         cstatus = d2.get("creator_token_status", "")
-        if DEV_MUST_CLOSE and cstatus == "creator_hold":
-            return False, "G2:dev_still_holding"
+        if cstatus == "creator_hold":
+            if DEV_MUST_CLOSE and source == 'hot_inflow':
+                return False, "G2:dev_still_holding"
+            elif cstatus == "creator_hold":
+                log(f"  NOTE G2:dev_still_holding (signal path, not rejected)")
         if d2.get("is_wash_trading"):
             return False, "G2:wash"
 
@@ -437,7 +471,7 @@ def main():
     log(f"Wallet: {WALLET}")
     log(f"Day safety: ${SAFETY_LINE} | Night safety: ${SAFETY_LINE_NIGHT}")
     log(f"Signal: OKX inflowUsd>${OKX_INFLOW_MIN} + riskLevel<={OKX_RISK_MAX} + SM>={MIN_SM_WALLETS}")
-    log(f"MC: ${MIN_MC}-${MAX_MC} | DEV_MUST_CLOSE: {DEV_MUST_CLOSE}")
+    log(f"MC: ${MIN_MC}-${MAX_MC} | DEV_MUST_CLOSE: {DEV_MUST_CLOSE} (hot-path only) | MAX_SOLD_RATIO: {MAX_SOLD_RATIO}%")
     log("=" * 60)
 
     event_queue = queue.Queue()
@@ -508,37 +542,60 @@ def main():
                 aggregator.add_event("signal", evt)
                 aggregator.add_event("sm_tracker", evt)
 
-        # 获取强信号
+        # ── 路径A：hot-tokens 直接驱动候选 ──────────────────────────────────────
+        hot_candidates = get_hot_token_candidates(hot_data)
+
+        # ── 路径B：signal list 补充候选 ──────────────────────────────────────────
         strong = aggregator.get_strong_signals()
-        if strong and now - last_hot_log > 60:
-            top = strong[0]
-            hot_info = hot_data.get(top['addr'], {})
-            inflow = hot_info.get('inflow', 'N/A')
-            log(f"Top signal: {top['sym']} wallets={top['wallets']} sold={top['sold']:.0f}% inflow=${inflow}")
+
+        # 合并去重（路径A优先）
+        seen_addrs = set(c['addr'] for c in hot_candidates)
+        sig_candidates = []
+        for s in strong:
+            if s['addr'] not in seen_addrs:
+                s.setdefault('source', 'signal')
+                sig_candidates.append(s)
+
+        all_candidates = hot_candidates + sig_candidates
+
+        if all_candidates and now - last_hot_log > 60:
+            top = all_candidates[0]
+            src_tag = top.get('source', '?')
+            if src_tag == 'hot_inflow':
+                log(f"Top candidate [HOT] {top['sym']} MC=${top['mc']:.0f} change=+{top.get('change',0):.1f}% inflow=${top.get('inflow',0):.0f}")
+            else:
+                hot_info = hot_data.get(top['addr'], {})
+                inflow = hot_info.get('inflow', 'N/A')
+                log(f"Top candidate [SIG] {top['sym']} wallets={top.get('wallets',0)} sold={top.get('sold',0):.0f}% inflow=${inflow}")
             last_hot_log = now
 
         if len(positions) >= MAX_POSITIONS:
             time.sleep(2 if not fallback_mode else 30)
             continue
 
-        # 评估候选
-        for sig in strong[:3]:
-            addr = sig["addr"]
-            sym  = sig["sym"]
-            mc   = sig["mc"]
+        # 评估候选（top 6，路径A + 路径B混合）
+        for sig in all_candidates[:6]:
+            addr   = sig["addr"]
+            sym    = sig["sym"]
+            mc     = sig["mc"]
+            src    = sig.get("source", "signal")
+            src_tag = "HOT" if src == "hot_inflow" else "SIG"
 
             if addr in acted or addr in positions:
                 continue
 
-            # 检查 OKX hot-tokens 里是否有这个币且 inflowUsd > 0
             hot_info = hot_data.get(addr, {})
-            inflow = hot_info.get('inflow', 0)
-            in_hot = addr in hot_data
+            inflow   = hot_info.get('inflow', 0)
+            in_hot   = addr in hot_data
 
-            log(f"\nEval {sym} ({addr[:12]}...) MC=${mc:.0f} wallets={sig['wallets']} sold={sig['sold']:.0f}% inflow=${inflow:.0f} in_hot={in_hot}")
+            if src_tag == "HOT":
+                log(f"\nEval [{src_tag}] {sym} ({addr[:12]}...) MC=${mc:.0f} change=+{sig.get('change',0):.1f}% inflow=${inflow:.0f}")
+            else:
+                log(f"\nEval [{src_tag}] {sym} ({addr[:12]}...) MC=${mc:.0f} wallets={sig.get('wallets',0)} sold={sig.get('sold',0):.0f}%")
 
-            # 如果不在 OKX hot-tokens 里，仍然可以进，但 Gate0 会自动跳过 inflowUsd 检查
-            ok, reason = gate_check(addr, hot_data if in_hot else None)
+            # 路径A：Gate0已由候选条件筛过，直接传 None；路径B传 hot_data
+            gate_hot = None if src == 'hot_inflow' else (hot_data if in_hot else None)
+            ok, reason = gate_check(addr, gate_hot, source=src)
             if not ok:
                 log(f"  REJECT {reason}")
                 acted.add(addr)
@@ -561,7 +618,7 @@ def main():
                 positions[addr] = {
                     "sym": sym, "amount_usd": pos_size,
                     "entry_time": time.time(), "entry_price": 0,
-                    "source": sig.get("source", "ws")
+                    "source": src
                 }
                 acted.add(addr)
                 usdc -= pos_size
