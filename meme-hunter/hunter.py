@@ -257,7 +257,14 @@ def load_existing_positions():
         val_usd = sf(a.get("usdValue", 0))
         if sym in skip_syms or not addr or val_usd < 0.5:
             continue
-        entry_price = get_token_price(addr)
+        entry_price = 0
+        for _try in range(3):
+            entry_price = get_token_price(addr)
+            if entry_price > 0:
+                break
+            time.sleep(1)
+        if entry_price <= 0:
+            log(f"  WARN: {sym} takeover price=0 after 3 retries, storing entry_price=0 amt_tokens=0")
         positions[addr] = {
             "sym":           sym,
             "amount_usd":    val_usd,
@@ -909,7 +916,7 @@ def check_positions(positions, daily_state):
                             if daily_state["tier_c_consecutive_losses"] >= 2:
                                 daily_state["tier_c_pause_until"] = time.time() + TIER_C_COOLDOWN
                         del positions[addr]
-                    _time_decay_triggered = True
+                        _time_decay_triggered = True   # FIXED: only fires on successful sell
                     break
             if _time_decay_triggered:
                 continue
@@ -1262,14 +1269,15 @@ def main():
                             break
                         time.sleep(2)
                     if entry_price <= 0:
-                        log(f"  WARN: {sym} price=0 after 3 retries, using sentinel 1e-18")
-                        entry_price = 1e-18
-                    amt_tokens = size / entry_price
+                        log(f"  WARN: {sym} price=0 after 3 retries, storing amt_tokens=0 (will retry in check_positions)")
+                        amt_tokens = 0
+                    else:
+                        amt_tokens = size / entry_price
                     positions[addr] = {
                         "sym":           sym,
                         "amount_usd":    size,
-                        "amount_tokens": amt_tokens,
-                        "entry_price":   entry_price,
+                        "amount_tokens": amt_tokens,    # 0 if price unavailable
+                        "entry_price":   entry_price,   # may be 0 — check_positions will log and skip
                         "entry_time":    time.time(),
                         "tier":          "TIER_A",
                         "tp1_done":      False,
@@ -1332,14 +1340,15 @@ def main():
                             break
                         time.sleep(2)
                     if entry_price <= 0:
-                        log(f"  WARN: {sym} price=0 after 3 retries, using sentinel 1e-18")
-                        entry_price = 1e-18
-                    amt_tokens = size / entry_price
+                        log(f"  WARN: {sym} price=0 after 3 retries, storing amt_tokens=0 (will retry in check_positions)")
+                        amt_tokens = 0
+                    else:
+                        amt_tokens = size / entry_price
                     positions[addr] = {
                         "sym":           sym,
                         "amount_usd":    size,
-                        "amount_tokens": amt_tokens,
-                        "entry_price":   entry_price,
+                        "amount_tokens": amt_tokens,    # 0 if price unavailable
+                        "entry_price":   entry_price,   # may be 0 — check_positions will log and skip
                         "entry_time":    time.time(),
                         "tier":          "TIER_B",
                         "tp1_done":      False,
@@ -1403,14 +1412,15 @@ def main():
                             break
                         time.sleep(2)
                     if entry_price <= 0:
-                        log(f"  WARN: {sym} price=0 after 3 retries, using sentinel 1e-18")
-                        entry_price = 1e-18
-                    amt_tokens = size / entry_price
+                        log(f"  WARN: {sym} price=0 after 3 retries, storing amt_tokens=0 (will retry in check_positions)")
+                        amt_tokens = 0
+                    else:
+                        amt_tokens = size / entry_price
                     positions[addr] = {
                         "sym":             sym,
                         "amount_usd":      size,
-                        "amount_tokens":   amt_tokens,
-                        "entry_price":     entry_price,
+                        "amount_tokens":   amt_tokens,    # 0 if price unavailable
+                        "entry_price":     entry_price,   # may be 0 — check_positions will log and skip
                         "entry_time":      time.time(),
                         "tier":            "TIER_C",
                         "tp1_done":        False,
