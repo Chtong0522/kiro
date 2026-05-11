@@ -58,17 +58,18 @@ MIN_BONDING    = 70
 MAX_BONDING    = 97
 MAX_INSIDERS   = 30
 MAX_TOP10_B    = 40
-TIER_B_MIN_MC  = 30000   # MC 至少 $30k，过滤极小垃圾币
-TIER_B_MIN_HOLDERS = 50  # 至少 50 个持有人，说明有真实社区
-TIER_B_MIN_APED    = 2   # 至少 2 个 OKX 用户跟单（提高置信度）
+TIER_B_MIN_MC      = 12000   # MIGRATING tokens MC range is $12k-$29k
+TIER_B_MIN_HOLDERS = 30      # Reduced from 50
+TIER_B_MIN_APED    = 1       # Reduced from 2
 
-# Tier C 过滤（NEW 机器人触发）— 严格条件，宁缺毋滥
-MIN_BONDING_C   = 3
-MAX_BONDING_C   = 10
-MAX_TOKEN_AGE_C = 3    # 最多 3 分钟（更严格的时间窗口）
-TIER_C_MIN_MC        = 8000   # MC 至少 $8000（更高门槛）
-TIER_C_MIN_HOLDERS   = 15     # 至少 15 个持币地址（2个根本不够）
-TIER_C_MIN_BUY_TX    = 10     # 至少 10 笔买单（有真实买盘）
+# Tier C 过滤（EARLY MIGRATING 早期毕业预埋）— 30-65% bonding 区间
+MIN_BONDING_C        = 30     # 早期毕业前段
+MAX_BONDING_C        = 65     # 还没到冲刺阶段
+TIER_C_MIN_MC        = 5000   # MC 至少 $5000
+TIER_C_MAX_MC        = 15000  # MC 最多 $15000（小市值早期）
+TIER_C_MIN_HOLDERS   = 20     # 至少 20 个持币地址
+TIER_C_MIN_BUY_TX    = 5      # 至少 5 笔买单
+TIER_C_TIMEOUT_MIN   = 30     # 超时 30 分钟（early MIGRATING 需要时间）
 
 # 刷新间隔（秒）
 HOT_REFRESH       = 300
@@ -368,26 +369,15 @@ def execute_swap(from_addr, to_addr, amount_readable, is_sell=False):
 
 # ─── Tier A：智能钱包跟单信号引擎 ─────────────────────────────────────────────
 #
-# sm_buys[token_addr] = {
-#     'wallets': set(),      # 买入的唯一 SM 钱包地址
-#     'first_seen': float,   # 第一个 SM 钱包买入时间戳
-#     'last_seen': float,    # 最近一次 SM 钱包买入时间戳
-#     'mc': float,
-#     'sym': str,
-# }
-
-def fetch_sm_activities(sm_buys):
+def fetch_sm_signals():
     """
-    调用 onchainos tracker activities，更新 sm_buys dict。
+    使用 onchainos signal list API 获取 SM 信号。
     返回信号列表：[(addr, signal_strength, n_wallets, mc, sym), ...]
-      signal_strength: 'STRONG' (>=2 钱包 10 分钟内) 或 'NORMAL' (1 钱包)
-    同时清理超过 1 小时的陈旧条目。
+      signal_strength: 'STRONG' (triggerWalletCount >= 3) 或 'NORMAL' (== 2)
     """
     cmd = (
-        "onchainos tracker activities "
-        "--tracker-type smart_money --chain solana --trade-type 1 "
-        "--min-volume 500 --min-market-cap 50000 --max-market-cap 2000000 "
-        "--min-liquidity 5000 --max-liquidity 200000"
+        "onchainos signal list "
+        "--chain solana --wallet-type 1,2,3 --min-address-count 2"
     )
     out = run(cmd, timeout=30)
     d = jparse(out)
@@ -395,48 +385,26 @@ def fetch_sm_activities(sm_buys):
     if isinstance(items, dict):
         items = items.get("list", [])
 
-    now = time.time()
+    signals = []
     for item in (items or []):
-        addr   = item.get("tokenContractAddress", "")
-        sym    = item.get("tokenSymbol", "?")
-        mc     = sf(item.get("marketCap", 0))
-        wallet = item.get("walletAddress", "")
+        addr      = item.get("tokenContractAddress", item.get("tokenAddress", ""))
+        sym       = item.get("tokenSymbol", item.get("symbol", "?"))
+        mc        = sf(item.get("marketCap", item.get("market", {}).get("marketCapUsd", 0)))
+        n_wallets = int(sf(item.get("triggerWalletCount", item.get("addressCount", 0))))
+        sold_ratio = sf(item.get("soldRatioPercent", 100))
+
         if not addr:
             continue
-        if addr not in sm_buys:
-            sm_buys[addr] = {
-                "wallets":    set(),
-                "first_seen": now,
-                "last_seen":  now,
-                "mc":         mc,
-                "sym":        sym,
-            }
-        entry = sm_buys[addr]
-        if wallet:
-            entry["wallets"].add(wallet)
-        entry["last_seen"] = now
-        if mc > 0:
-            entry["mc"] = mc
-        if sym != "?":
-            entry["sym"] = sym
-
-    # 清理超过 1 小时的条目 (Fix 4: use last_seen not first_seen for staleness)
-    stale = [a for a, e in sm_buys.items() if now - e["last_seen"] > 3600]
-    for a in stale:
-        del sm_buys[a]
-
-    # 生成信号列表
-    signals = []
-    for addr, entry in sm_buys.items():
-        n = len(entry["wallets"])
-        window = entry["last_seen"] - entry["first_seen"]
-        if n >= 2 and window <= SM_WINDOW:
-            strength = "STRONG"
-        elif n >= 1:
-            strength = "NORMAL"
-        else:
+        # Filter: MC $20k-$2M, soldRatio < 40%, at least 2 wallets
+        if not (20000 <= mc <= 2000000):
             continue
-        signals.append((addr, strength, n, entry["mc"], entry["sym"]))
+        if sold_ratio >= 40:
+            continue
+        if n_wallets < 2:
+            continue
+
+        strength = "STRONG" if n_wallets >= 3 else "NORMAL"
+        signals.append((addr, strength, n_wallets, mc, sym))
 
     return signals
 
@@ -593,15 +561,23 @@ def fetch_migrating_tokens():
         if top10 >= MAX_TOP10_B:
             continue
         if aped < TIER_B_MIN_APED:
+            log(f"  TIER_B_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
             continue
         if mc < TIER_B_MIN_MC:
+            log(f"  TIER_B_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
             continue
         holders = int(sf(t.get("tags", {}).get("totalHolders", 0)))
         if holders < TIER_B_MIN_HOLDERS:
+            log(f"  TIER_B_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
             continue
         if not has_social:
+            log(f"  TIER_B_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
             continue
-        if buy_tx <= sell_tx:
+        if sell_tx == 0 and buy_tx < 3:
+            log(f"  TIER_B_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
+            continue
+        if sell_tx > 0 and buy_tx <= sell_tx:
+            log(f"  TIER_B_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
             continue
 
         t["tokenAddress"] = addr
@@ -612,23 +588,27 @@ def fetch_migrating_tokens():
     return candidates
 
 
-# ─── Tier C：NEW 机器人触发抢跑信号引擎 ──────────────────────────────────────
+# ─── Tier C：EARLY MIGRATING 早期毕业预埋信号引擎 ─────────────────────────────
 
-def fetch_new_tokens():
+def fetch_early_migrating_tokens():
     """
-    调用 onchainos memepump tokens NEW，过滤极早期候选。
+    调用 onchainos memepump tokens MIGRATING，过滤早期毕业候选（30-65% bonding）。
+    Tier C 策略：早期毕业前段埋伏，等待 bonding 曲线继续爬升。
     过滤条件：
-      - bondingPercent 3-10
-      - devHoldingsPercent == 0
-      - totalHolders >= 2
-      - buyTxCount1h > 5
+      - bondingPercent 30-65
+      - devHoldingsPercent == 0 (dev 已出局)
+      - insidersPercent < 20 (更严格)
+      - MC $5k-$15k
+      - totalHolders >= 20
+      - aped >= 1
+      - 有社交媒体
+      - buyTxCount1h >= 5 且 buy_tx > sell_tx * 1.5（买盘显著强于卖盘）
     返回候选列表
     """
     cmd = (
         "onchainos memepump tokens "
-        "--chain solana --stage NEW --dev-sell-all true "
-        f"--min-bonding-percent {MIN_BONDING_C} --max-bonding-percent {MAX_BONDING_C} "
-        f"--max-token-age {MAX_TOKEN_AGE_C}"
+        "--chain solana --stage MIGRATING --dev-sell-all true "
+        f"--min-bonding-percent {MIN_BONDING_C} --max-bonding-percent {MAX_BONDING_C}"
     )
     out = run(cmd, timeout=30)
     d = jparse(out)
@@ -640,8 +620,17 @@ def fetch_new_tokens():
     for t in (items or []):
         bonding   = sf(t.get("bondingPercent", 0))
         dev_hold  = sf(t.get("tags", {}).get("devHoldingsPercent", 1))
+        insiders  = sf(t.get("tags", {}).get("insidersPercent", 100))
         holders   = int(sf(t.get("tags", {}).get("totalHolders", 0)))
+        aped      = int(sf(t.get("aped", 0)))
         buy_tx    = int(sf(t.get("market", {}).get("buyTxCount1h", 0)))
+        sell_tx   = int(sf(t.get("market", {}).get("sellTxCount1h", 0)))
+        social    = t.get("social", {})
+        has_social = any([
+            social.get("x", ""),
+            social.get("telegram", ""),
+            social.get("website", ""),
+        ])
         addr = t.get("tokenAddress", "")
         sym  = t.get("symbol", "?")
         mc   = sf(t.get("market", {}).get("marketCapUsd", 0))
@@ -652,11 +641,29 @@ def fetch_new_tokens():
             continue
         if dev_hold != 0:
             continue
-        if mc < TIER_C_MIN_MC:
+        if insiders >= 20:
+            continue
+        if not (TIER_C_MIN_MC <= mc <= TIER_C_MAX_MC):
+            log(f"  TIER_C_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
             continue
         if holders < TIER_C_MIN_HOLDERS:
+            log(f"  TIER_C_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
+            continue
+        if aped < 1:
+            log(f"  TIER_C_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
+            continue
+        if not has_social:
+            log(f"  TIER_C_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
             continue
         if buy_tx < TIER_C_MIN_BUY_TX:
+            log(f"  TIER_C_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
+            continue
+        # buy pressure must be significantly stronger than sell
+        if sell_tx == 0 and buy_tx < 5:
+            log(f"  TIER_C_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
+            continue
+        if sell_tx > 0 and buy_tx <= sell_tx * 1.5:
+            log(f"  TIER_C_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
             continue
 
         t["tokenAddress"] = addr
@@ -822,11 +829,11 @@ def check_positions(positions, daily_state):
             log(f"  price_zero [{n}/10] {sym}")
             if n < 10:
                 # Not yet confirmed zero — only act on Tier C timeout after 10 confirms
-                if ("C" in tier) and age_min > 3 and not pos.get("timeout_done"):
+                if ("C" in tier) and age_min > TIER_C_TIMEOUT_MIN and not pos.get("timeout_done"):
                     log(f"  timeout Tier C {sym} ({age_min:.1f}min) — no price data (waiting {n}/10)")
                 continue
             # zero_price_count >= 10: proceed with emergency action
-            if ("C" in tier) and age_min > 3 and not pos.get("timeout_done"):
+            if ("C" in tier) and age_min > TIER_C_TIMEOUT_MIN and not pos.get("timeout_done"):
                 log(f"  timeout Tier C {sym} ({age_min:.1f}min) — no price data")
                 ok, _ = sell_token(addr, sym, amt_tokens, "Tier_C_timeout_no_price")
                 if ok:
@@ -1097,9 +1104,9 @@ def check_positions(positions, daily_state):
 
         # ── Tier C TP/SL ─────────────────────────────────────────────────────
         elif "C" in tier:
-            # TP: +20% → 全清
-            if pnl_pct >= 0.20:
-                ok, _ = sell_token(addr, sym, pos["amount_tokens"], f"Tier_C_TP +{pnl_pct:.0%}")
+            # TP: +40% → 全清
+            if pnl_pct >= 0.40:
+                ok, _ = sell_token(addr, sym, pos["amount_tokens"], f"Tier_C_TP +{pnl_pct:.0%} full_exit")
                 if ok:
                     realized = pos["amount_tokens"] * cur - pos["amount_usd"]
                     add_realized_pnl(daily_state, realized)
@@ -1131,8 +1138,8 @@ def check_positions(positions, daily_state):
                     del positions[addr]
                 continue
 
-            # 超时：3 分钟 → 全清
-            if age_min > 3 and not pos.get("timeout_done"):
+            # 超时：TIER_C_TIMEOUT_MIN 分钟 → 全清
+            if age_min > TIER_C_TIMEOUT_MIN and not pos.get("timeout_done"):
                 ok, _ = sell_token(addr, sym, pos["amount_tokens"], f"Tier_C_timeout {age_min:.1f}min")
                 if ok:
                     realized = pos["amount_tokens"] * cur - pos["amount_usd"]
@@ -1158,7 +1165,6 @@ def main():
         "tier_c_consecutive_losses":   0,
         "tier_c_pause_until":          0.0,
     }
-    sm_buys      = {}
     hot_cache    = {}
     hot_cache_ts = 0
 
@@ -1180,15 +1186,15 @@ def main():
     save_acted(acted)
 
     log("=" * 60)
-    log("SOL MEME HUNTER v5.2 — 三层预测架构 + 日亏损重启熔断")
+    log("SOL MEME HUNTER v5.3 — 三层预测架构 + 精准入场")
     log(f"Wallet: {WALLET}")
     log(f"Safety  DAY=${SAFETY_LINE_DAY}  NIGHT=${SAFETY_LINE_NIGHT}  DAILY_LOSS_LIMIT=${DAILY_LOSS_LIMIT}")
     log(f"Tier A size={TIER_A_SIZE}(night={TIER_A_NIGHT})  MC ${SM_MIN_MC}-${SM_MAX_MC}  liq ${SM_MIN_LIQ}-${SM_MAX_LIQ}")
     log(f"Tier B size={TIER_B_SIZE}(night={TIER_B_NIGHT})  bonding {MIN_BONDING}-{MAX_BONDING}%")
-    log(f"Tier C size={TIER_C_SIZE}  bonding {MIN_BONDING_C}-{MAX_BONDING_C}%  max_age {MAX_TOKEN_AGE_C}min  daily_limit={MAX_TIER_C_DAY}")
+    log(f"Tier C size={TIER_C_SIZE}  bonding {MIN_BONDING_C}-{MAX_BONDING_C}%  MC ${TIER_C_MIN_MC}-${TIER_C_MAX_MC}  timeout={TIER_C_TIMEOUT_MIN}min  daily_limit={MAX_TIER_C_DAY}")
     log(f"Refresh  SM={SM_REFRESH}s  MIGRATING={MIGRATING_REFRESH}s  NEW={NEW_REFRESH}s  HOT={HOT_REFRESH}s")
-    log(f"v5.1: confidence_scoring | K1_pump_guard | TOP_ZONE_filter | FAST_DUMP | trailing_stop({TRAIL_DISTANCE_A:.0%}A/{TRAIL_DISTANCE_B:.0%}B)")
-    log(f"v5.1: time_decay_SL {TIME_DECAY_SL} | 3-check_protection | cooldown_dedup(30min) | session_pause({SESSION_CONSEC_LOSS_MAX}loss/{SESSION_CONSEC_PAUSE}s) | liq_emergency($5k)")
+    log(f"v5.3: confidence_scoring | K1_pump_guard | TOP_ZONE_filter | FAST_DUMP | trailing_stop({TRAIL_DISTANCE_A:.0%}A/{TRAIL_DISTANCE_B:.0%}B)")
+    log(f"v5.3: time_decay_SL {TIME_DECAY_SL} | 3-check_protection | cooldown_dedup(30min) | session_pause({SESSION_CONSEC_LOSS_MAX}loss/{SESSION_CONSEC_PAUSE}s) | liq_emergency($5k)")
     log(f"Existing positions: {len(positions)}")
     log("=" * 60)
 
@@ -1232,7 +1238,7 @@ def main():
 
         # ── Tier A：SM tracker（每 SM_REFRESH=30s）─────────────────────────
         if now - last_sm_check > SM_REFRESH:
-            signals = fetch_sm_activities(sm_buys)
+            signals = fetch_sm_signals()
             log(f"Tier A SM signals: {len(signals)}")
             for addr, strength, n_wallets, mc, sym in signals:
                 if is_acted(acted, addr) or addr in positions:
@@ -1385,10 +1391,10 @@ def main():
                     save_acted(acted)
             last_migrating_check = now
 
-        # ── Tier C：NEW（每 NEW_REFRESH=15s，夜间禁止）────────────────────
+        # ── Tier C：EARLY MIGRATING（每 NEW_REFRESH=15s，夜间禁止）────────────
         if not is_night_time() and now - last_new_check > NEW_REFRESH:
-            candidates_c = fetch_new_tokens()
-            log(f"Tier C NEW candidates: {len(candidates_c)}")
+            candidates_c = fetch_early_migrating_tokens()
+            log(f"Tier C EARLY_MIGRATING candidates: {len(candidates_c)}")
             for t in candidates_c:
                 addr    = t.get("tokenAddress", "")
                 sym     = t.get("_sym", "?")
