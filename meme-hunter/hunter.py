@@ -69,6 +69,26 @@ SM_REFRESH        = 30
 MIGRATING_REFRESH = 60
 NEW_REFRESH       = 15
 
+# ─── v5.1 策略常量 ────────────────────────────────────────────────────────────
+# 追踪止损：TP1 后从峰值回撤触发清仓
+TRAIL_DISTANCE_A = 0.12   # 12% drawdown from peak after TP1 → exit Tier A
+TRAIL_DISTANCE_B = 0.10   # 10% drawdown from peak after TP1 → exit Tier B
+
+# 时间衰减止损：持仓时间过长但未达硬止损时提前离场
+TIME_DECAY_SL = [(30, -0.08), (60, -0.05)]  # (minutes_held, pnl_threshold)
+
+# 会话连续亏损熔断
+SESSION_CONSEC_LOSS_MAX = 3
+SESSION_CONSEC_PAUSE    = 600   # 10 分钟
+
+
+# ─── v5.1 模块级状态 ──────────────────────────────────────────────────────────
+# 信号冷却去重：卖出后 30 分钟内不重新买同一 token
+cooldown_until: dict = {}
+
+# 会话连续亏损状态
+session_state = {'consecutive_losses': 0, 'pause_until': 0.0}
+
 
 # ─── 工具函数 ────────────────────────────────────────────────────────────────
 
@@ -223,6 +243,9 @@ def load_existing_positions():
             "tp2_done":      False,
             "tp3_done":      False,
             "holders_at_entry": 0,
+            "peak_price":    entry_price if entry_price > 0 else 0.0,
+            "last_liq_check": 0,
+            "zero_price_count": 0,
         }
         log(f"  接管 {sym}: {bal:.2f}枚 ~${val_usd:.2f} entry=${entry_price:.8f} addr={addr[:12]}...")
     log(f"  接管完成，共 {len(positions)} 个持仓")
@@ -421,6 +444,57 @@ def get_hot_inflow(hot_cache, addr):
     return hot_cache.get(addr, {}).get("inflow", 0)
 
 
+# ─── v5.1：K1 pump guard + TOP_ZONE filter ───────────────────────────────────
+
+def check_k1_pump(addr, sym="?"):
+    """
+    查询最近 1 分钟 K 线，若涨幅 > +15% 则返回 True（防追高）。
+    API 失败时 fail-open 返回 False。
+    """
+    try:
+        out = run(f"onchainos market kline --chain solana --address {addr} --bar 1m", timeout=15)
+        d = jparse(out)
+        candles = d.get("data", [])
+        if not candles:
+            return False
+        last = candles[-1]
+        close = sf(last.get("close", 0))
+        open_ = sf(last.get("open", close))
+        if open_ <= 0:
+            return False
+        pct = (close - open_) / open_
+        if pct > 0.15:
+            log(f"  K1_PUMP_GUARD: skip {sym} 1m={pct:.1%}")
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def check_top_zone(addr, cur_price, sym="?"):
+    """
+    取最近 12 根 5m K 线（= 1h），若当前价 > 85% of 1h high → True（处于顶部区）。
+    API 失败时 fail-open 返回 False。
+    """
+    try:
+        out = run(f"onchainos market kline --chain solana --address {addr} --bar 5m", timeout=15)
+        d = jparse(out)
+        candles = d.get("data", [])
+        if not candles:
+            return False
+        recent = candles[-12:] if len(candles) >= 12 else candles
+        h1_high = max(sf(c.get("high", 0)) for c in recent)
+        if h1_high <= 0:
+            return False
+        pct = cur_price / h1_high
+        if pct > 0.85:
+            log(f"  TOP_ZONE: {sym} at {pct:.0%} of 1h high")
+            return True
+        return False
+    except Exception:
+        return False
+
+
 # ─── Tier B：MIGRATING 毕业伏击信号引擎 ──────────────────────────────────────
 
 def fetch_migrating_tokens():
@@ -593,10 +667,20 @@ def check_sm_exiting(addr):
 
 # ─── 入场守卫 ─────────────────────────────────────────────────────────────────
 
-def entry_guard(positions, daily_state, usdc, tier):
+def entry_guard(positions, daily_state, usdc, tier, addr=None):
     """
     所有入场前检查，返回 (True, size) 或 (False, reason)
     """
+    # v5.1: session consecutive loss pause
+    if time.time() < session_state['pause_until']:
+        remaining = session_state['pause_until'] - time.time()
+        return False, f"session_paused {remaining:.0f}s left"
+
+    # v5.1: signal cooldown dedup
+    if addr and time.time() < cooldown_until.get(addr, 0):
+        remaining = cooldown_until[addr] - time.time()
+        return False, f"cooldown {remaining:.0f}s left"
+
     safety = get_safety_line()
     night = is_night_time()
 
@@ -633,11 +717,33 @@ def entry_guard(positions, daily_state, usdc, tier):
 
 # ─── 持仓监控与 TP/SL ────────────────────────────────────────────────────────
 
+def _record_sell_outcome(pnl_usd, addr):
+    """
+    记录卖出结果：更新 session 连续亏损计数 + 设置冷却。
+    在每一次 sell 成功后调用。
+    """
+    # cooldown dedup: 30 分钟内不重入
+    cooldown_until[addr] = time.time() + 1800
+
+    # session consecutive loss tracking
+    if pnl_usd < 0:
+        session_state['consecutive_losses'] += 1
+        if session_state['consecutive_losses'] >= SESSION_CONSEC_LOSS_MAX:
+            session_state['pause_until'] = time.time() + SESSION_CONSEC_PAUSE
+            log(f"  SESSION_PAUSE: {SESSION_CONSEC_LOSS_MAX} consecutive losses, pausing {SESSION_CONSEC_PAUSE//60}min")
+    else:
+        session_state['consecutive_losses'] = 0
+
 def check_positions(positions, daily_state):
     """
     主持仓监控，按层级规则执行止盈止损。
-    每次调用输出每个持仓的状态日志：
-      [HH:MM:SS] TIER_X SYMBOL: entry=$x.x(Nt) now=$x.xx X.XXx PnL=+/-x.x%($x.xx) age=X.Xh
+    v5.1 新增（按优先级顺序）：
+      1. FAST_DUMP    — 从峰值下跌 >=15% 且当前亏损 → 立即清仓
+      2. LIQ_EMERGENCY — 每 5 分钟检查流动性，< $5000 清仓
+      3. Time-decay SL — 超时仍亏损提前离场
+      4. Trailing Stop — TP1 后从峰值回撤清仓
+      5. 原有 TP/SL 逻辑
+    3-check protection: get_token_price 返回 0 时累计，>=3 次才执行紧急操作。
     """
     if not positions:
         return
@@ -656,22 +762,45 @@ def check_positions(positions, daily_state):
         age_min    = age_h * 60
 
         cur = get_token_price(addr)
-        if not cur or not entry or not amt_tokens:
-            log(f"  ? {tier} {sym}: no price data age={age_h:.1f}h")
-            # Tier C 超时兜底
+
+        # ── 3-check protection ──────────────────────────────────────────────
+        if not cur:
+            pos['zero_price_count'] = pos.get('zero_price_count', 0) + 1
+            n = pos['zero_price_count']
+            log(f"  price_zero [{n}/3] {sym}")
+            if n < 3:
+                # Not yet confirmed zero — only act on Tier C timeout after 3 confirms
+                if ("C" in tier) and age_min > 3 and not pos.get("timeout_done"):
+                    log(f"  timeout Tier C {sym} ({age_min:.1f}min) — no price data (waiting {n}/3)")
+                continue
+            # zero_price_count >= 3: proceed with emergency action
             if ("C" in tier) and age_min > 3 and not pos.get("timeout_done"):
                 log(f"  timeout Tier C {sym} ({age_min:.1f}min) — no price data")
                 ok, _ = sell_token(addr, sym, amt_tokens, "Tier_C_timeout_no_price")
                 if ok:
-                    pnl_usd = 0.0
-                    add_realized_pnl(daily_state, pnl_usd)
+                    pnl_usd_val = 0.0
+                    add_realized_pnl(daily_state, pnl_usd_val)
+                    _record_sell_outcome(pnl_usd_val, addr)
                     daily_state["tier_c_count"] = daily_state.get("tier_c_count", 0) + 1
                     daily_state["tier_c_consecutive_losses"] = daily_state.get("tier_c_consecutive_losses", 0) + 1
                     if daily_state["tier_c_consecutive_losses"] >= 2:
                         daily_state["tier_c_pause_until"] = time.time() + TIER_C_COOLDOWN
                         log(f"  Tier C 连续亏损 2 次，冷却 {TIER_C_COOLDOWN/3600:.0f}h")
                     del positions[addr]
+            else:
+                log(f"  ? {tier} {sym}: no price data (3+ zeros) age={age_h:.1f}h")
             continue
+
+        # Price obtained — reset zero counter
+        pos['zero_price_count'] = 0
+
+        if not entry or not amt_tokens:
+            log(f"  ? {tier} {sym}: no entry data age={age_h:.1f}h")
+            continue
+
+        # Update peak_price
+        peak = max(pos.get('peak_price', entry), cur)
+        pos['peak_price'] = peak
 
         pnl_pct = (cur - entry) / entry if entry > 0 else 0
         cur_val  = amt_tokens * cur
@@ -685,6 +814,69 @@ def check_positions(positions, daily_state):
             f"PnL={pnl_pct:+.1%}(${pnl_usd:+.2f}) age={age_h:.1f}h"
         )
 
+        # ── FAST_DUMP (highest priority) ────────────────────────────────────
+        if peak > 0 and (peak - cur) / peak >= 0.15 and cur < entry:
+            drop = (peak - cur) / peak
+            log(f"  FAST_DUMP {sym}: peak=${peak:.6f} cur=${cur:.6f} drop={drop:.1%}")
+            ok, _ = sell_token(addr, sym, pos["amount_tokens"], "FAST_DUMP")
+            if ok:
+                realized = pos["amount_tokens"] * cur - amt_usd
+                add_realized_pnl(daily_state, realized)
+                _record_sell_outcome(realized, addr)
+                if "C" in tier:
+                    daily_state["tier_c_consecutive_losses"] = daily_state.get("tier_c_consecutive_losses", 0) + 1
+                    if daily_state["tier_c_consecutive_losses"] >= 2:
+                        daily_state["tier_c_pause_until"] = time.time() + TIER_C_COOLDOWN
+                del positions[addr]
+            continue
+
+        # ── Liquidity Emergency Exit (every 5 min per position) ─────────────
+        if now - pos.get('last_liq_check', 0) > 300:
+            pos['last_liq_check'] = now
+            try:
+                liq_out = run(f"onchainos market prices --tokens 501:{addr}", timeout=15)
+                liq_d = jparse(liq_out)
+                liq_items = liq_d.get("data", [])
+                if isinstance(liq_items, list) and liq_items:
+                    liq = sf(liq_items[0].get("liquidity", liq_items[0].get("liquidityUsd", 999999)))
+                elif isinstance(liq_items, dict):
+                    liq = sf(liq_items.get("liquidity", liq_items.get("liquidityUsd", 999999)))
+                else:
+                    liq = 999999
+                if 0 < liq < 5000:
+                    log(f"  LIQ_EMERGENCY {sym}: liq=${liq:.0f} < $5000")
+                    ok, _ = sell_token(addr, sym, pos["amount_tokens"], "LIQ_EMERGENCY")
+                    if ok:
+                        realized = pos["amount_tokens"] * cur - amt_usd
+                        add_realized_pnl(daily_state, realized)
+                        _record_sell_outcome(realized, addr)
+                        del positions[addr]
+                    continue
+            except Exception:
+                pass  # fail-open
+
+        # ── Time-decay SL (before tp1_done) ─────────────────────────────────
+        if not pos.get("tp1_done"):
+            _time_decay_triggered = False
+            for decay_min, decay_thresh in TIME_DECAY_SL:
+                if age_min > decay_min and pnl_pct < decay_thresh:
+                    reason = f"TimeDecaySL_{age_min:.0f}min"
+                    log(f"  TIME_DECAY_SL {sym}: age={age_min:.0f}min pnl={pnl_pct:.1%} < {decay_thresh:.0%}")
+                    ok, _ = sell_token(addr, sym, pos["amount_tokens"], reason)
+                    if ok:
+                        realized = pos["amount_tokens"] * cur - amt_usd
+                        add_realized_pnl(daily_state, realized)
+                        _record_sell_outcome(realized, addr)
+                        if "C" in tier:
+                            daily_state["tier_c_consecutive_losses"] = daily_state.get("tier_c_consecutive_losses", 0) + 1
+                            if daily_state["tier_c_consecutive_losses"] >= 2:
+                                daily_state["tier_c_pause_until"] = time.time() + TIER_C_COOLDOWN
+                        del positions[addr]
+                    _time_decay_triggered = True
+                    break
+            if _time_decay_triggered:
+                continue
+
         # ── Tier A / takeover TP/SL ──────────────────────────────────────────
         if "A" in tier or "TAKEOVER" in tier:
             # TP1: +50% → 卖 75%
@@ -695,11 +887,24 @@ def check_positions(positions, daily_state):
                     sold_usd = sell_amt * cur
                     realized = sold_usd - amt_usd * 0.75
                     add_realized_pnl(daily_state, realized)
+                    _record_sell_outcome(realized, addr)
                     pos["tp1_done"]      = True
                     pos["amount_tokens"] = amt_tokens * 0.25
                     pos["amount_usd"]    = amt_usd * 0.25
                     log(f"  Tier A TP1 done, 底仓 {pos['amount_tokens']:.0f}t (${pos['amount_usd']:.1f})")
                 continue
+
+            # Trailing Stop after TP1 (Tier A: 12% drawdown from peak, must be profitable)
+            if pos.get("tp1_done"):
+                if peak > 0 and (peak - cur) / peak >= TRAIL_DISTANCE_A and cur > entry:
+                    log(f"  TrailingStop TIER_A {sym}: peak=${peak:.6f} cur=${cur:.6f} drawdown={(peak-cur)/peak:.1%}")
+                    ok, _ = sell_token(addr, sym, pos["amount_tokens"], "TrailingStop")
+                    if ok:
+                        realized = pos["amount_tokens"] * cur - pos["amount_usd"]
+                        add_realized_pnl(daily_state, realized)
+                        _record_sell_outcome(realized, addr)
+                        del positions[addr]
+                    continue
 
             # TP2: +150% 且 tp1 已完成 → 再卖底仓 50%
             if pnl_pct >= 1.50 and pos.get("tp1_done") and not pos.get("tp2_done"):
@@ -709,6 +914,7 @@ def check_positions(positions, daily_state):
                     sold_usd = sell_amt * cur
                     realized = sold_usd - pos["amount_usd"] * 0.50
                     add_realized_pnl(daily_state, realized)
+                    _record_sell_outcome(realized, addr)
                     pos["tp2_done"]      = True
                     pos["amount_tokens"] = pos["amount_tokens"] * 0.50
                     pos["amount_usd"]    = pos["amount_usd"] * 0.50
@@ -723,6 +929,7 @@ def check_positions(positions, daily_state):
                     sold_usd = sell_amt * cur
                     realized = sold_usd - pos["amount_usd"] * 0.50
                     add_realized_pnl(daily_state, realized)
+                    _record_sell_outcome(realized, addr)
                     pos["tp3_done"]      = True
                     pos["amount_tokens"] = pos["amount_tokens"] * 0.50
                     pos["amount_usd"]    = pos["amount_usd"] * 0.50
@@ -738,6 +945,7 @@ def check_positions(positions, daily_state):
                     if ok:
                         realized = pos["amount_tokens"] * cur - pos["amount_usd"]
                         add_realized_pnl(daily_state, realized)
+                        _record_sell_outcome(realized, addr)
                         del positions[addr]
                 else:
                     log(f"  SM 未出货，持有至 -45%")
@@ -749,6 +957,7 @@ def check_positions(positions, daily_state):
                 if ok:
                     realized = pos["amount_tokens"] * cur - pos["amount_usd"]
                     add_realized_pnl(daily_state, realized)
+                    _record_sell_outcome(realized, addr)
                     pos["sl_done"] = True
                     del positions[addr]
                 continue
@@ -759,6 +968,7 @@ def check_positions(positions, daily_state):
                 if ok:
                     realized = pos["amount_tokens"] * cur - pos["amount_usd"]
                     add_realized_pnl(daily_state, realized)
+                    _record_sell_outcome(realized, addr)
                     pos["timeout_done"] = True
                     del positions[addr]
                 continue
@@ -773,11 +983,24 @@ def check_positions(positions, daily_state):
                     sold_usd = sell_amt * cur
                     realized = sold_usd - amt_usd * 0.70
                     add_realized_pnl(daily_state, realized)
+                    _record_sell_outcome(realized, addr)
                     pos["tp1_done"]      = True
                     pos["amount_tokens"] = amt_tokens * 0.30
                     pos["amount_usd"]    = amt_usd * 0.30
                     log(f"  Tier B TP1 done, 剩余 {pos['amount_tokens']:.0f}t")
                 continue
+
+            # Trailing Stop after TP1 (Tier B: 10% drawdown from peak, must be profitable)
+            if pos.get("tp1_done"):
+                if peak > 0 and (peak - cur) / peak >= TRAIL_DISTANCE_B and cur > entry:
+                    log(f"  TrailingStop TIER_B {sym}: peak=${peak:.6f} cur=${cur:.6f} drawdown={(peak-cur)/peak:.1%}")
+                    ok, _ = sell_token(addr, sym, pos["amount_tokens"], "TrailingStop")
+                    if ok:
+                        realized = pos["amount_tokens"] * cur - pos["amount_usd"]
+                        add_realized_pnl(daily_state, realized)
+                        _record_sell_outcome(realized, addr)
+                        del positions[addr]
+                    continue
 
             # TP2: +100% 且 tp1 完成 → 再卖剩余 50%
             if pnl_pct >= 1.00 and pos.get("tp1_done") and not pos.get("tp2_done"):
@@ -787,6 +1010,7 @@ def check_positions(positions, daily_state):
                     sold_usd = sell_amt * cur
                     realized = sold_usd - pos["amount_usd"] * 0.50
                     add_realized_pnl(daily_state, realized)
+                    _record_sell_outcome(realized, addr)
                     pos["tp2_done"]      = True
                     pos["amount_tokens"] = pos["amount_tokens"] * 0.50
                     pos["amount_usd"]    = pos["amount_usd"] * 0.50
@@ -799,6 +1023,7 @@ def check_positions(positions, daily_state):
                 if ok:
                     realized = pos["amount_tokens"] * cur - pos["amount_usd"]
                     add_realized_pnl(daily_state, realized)
+                    _record_sell_outcome(realized, addr)
                     pos["sl_done"] = True
                     del positions[addr]
                 continue
@@ -809,6 +1034,7 @@ def check_positions(positions, daily_state):
                 if ok:
                     realized = pos["amount_tokens"] * cur - pos["amount_usd"]
                     add_realized_pnl(daily_state, realized)
+                    _record_sell_outcome(realized, addr)
                     pos["timeout_done"] = True
                     del positions[addr]
                 continue
@@ -821,6 +1047,7 @@ def check_positions(positions, daily_state):
                 if ok:
                     realized = pos["amount_tokens"] * cur - pos["amount_usd"]
                     add_realized_pnl(daily_state, realized)
+                    _record_sell_outcome(realized, addr)
                     if realized >= 0:
                         daily_state["tier_c_consecutive_losses"] = 0
                     else:
@@ -840,6 +1067,7 @@ def check_positions(positions, daily_state):
                 if ok:
                     realized = pos["amount_tokens"] * cur - pos["amount_usd"]
                     add_realized_pnl(daily_state, realized)
+                    _record_sell_outcome(realized, addr)
                     daily_state["tier_c_consecutive_losses"] = daily_state.get("tier_c_consecutive_losses", 0) + 1
                     if daily_state["tier_c_consecutive_losses"] >= 2:
                         daily_state["tier_c_pause_until"] = time.time() + TIER_C_COOLDOWN
@@ -853,6 +1081,7 @@ def check_positions(positions, daily_state):
                 if ok:
                     realized = pos["amount_tokens"] * cur - pos["amount_usd"]
                     add_realized_pnl(daily_state, realized)
+                    _record_sell_outcome(realized, addr)
                     daily_state["tier_c_consecutive_losses"] = daily_state.get("tier_c_consecutive_losses", 0) + 1
                     if daily_state["tier_c_consecutive_losses"] >= 2:
                         daily_state["tier_c_pause_until"] = time.time() + TIER_C_COOLDOWN
@@ -892,13 +1121,15 @@ def main():
     save_acted(acted)
 
     log("=" * 60)
-    log("SOL MEME HUNTER v5 — 三层预测架构")
+    log("SOL MEME HUNTER v5.1 — 三层预测架构 + 12 策略强化")
     log(f"Wallet: {WALLET}")
     log(f"Safety  DAY=${SAFETY_LINE_DAY}  NIGHT=${SAFETY_LINE_NIGHT}  DAILY_LOSS_LIMIT=${DAILY_LOSS_LIMIT}")
     log(f"Tier A size={TIER_A_SIZE}(night={TIER_A_NIGHT})  MC ${SM_MIN_MC}-${SM_MAX_MC}  liq ${SM_MIN_LIQ}-${SM_MAX_LIQ}")
     log(f"Tier B size={TIER_B_SIZE}(night={TIER_B_NIGHT})  bonding {MIN_BONDING}-{MAX_BONDING}%")
     log(f"Tier C size={TIER_C_SIZE}  bonding {MIN_BONDING_C}-{MAX_BONDING_C}%  max_age {MAX_TOKEN_AGE_C}min  daily_limit={MAX_TIER_C_DAY}")
     log(f"Refresh  SM={SM_REFRESH}s  MIGRATING={MIGRATING_REFRESH}s  NEW={NEW_REFRESH}s  HOT={HOT_REFRESH}s")
+    log(f"v5.1: confidence_scoring | K1_pump_guard | TOP_ZONE_filter | FAST_DUMP | trailing_stop({TRAIL_DISTANCE_A:.0%}A/{TRAIL_DISTANCE_B:.0%}B)")
+    log(f"v5.1: time_decay_SL {TIME_DECAY_SL} | 3-check_protection | cooldown_dedup(30min) | session_pause({SESSION_CONSEC_LOSS_MAX}loss/{SESSION_CONSEC_PAUSE}s) | liq_emergency($5k)")
     log(f"Existing positions: {len(positions)}")
     log("=" * 60)
 
@@ -944,7 +1175,12 @@ def main():
             for addr, strength, n_wallets, mc, sym in signals:
                 if is_acted(acted, addr) or addr in positions:
                     continue
-                ok, size = entry_guard(positions, daily_state, usdc, "A")
+                # v5.1: cooldown dedup
+                if time.time() < cooldown_until.get(addr, 0):
+                    remaining = cooldown_until[addr] - time.time()
+                    log(f"  COOLDOWN: {sym} skip {remaining:.0f}s left")
+                    continue
+                ok, size = entry_guard(positions, daily_state, usdc, "A", addr=addr)
                 if not ok:
                     log(f"  SKIP Tier A {sym}: {size}")
                     continue
@@ -954,13 +1190,31 @@ def main():
                     if inflow <= 500:
                         log(f"  SKIP Tier A NORMAL {sym}: inflow=${inflow:.0f} <= 500")
                         continue
+                # v5.1: Confidence scoring
+                confidence = min(90, n_wallets * 30)
+                inflow_val = get_hot_inflow(hot_cache, addr)
+                if inflow_val > 500:
+                    confidence += 20
+                confidence = min(100, confidence)
+                if confidence < 60:
+                    log(f"  SKIP Tier A {sym}: confidence={confidence} < 60")
+                    continue
                 sec_ok, sec_reason = security_check(addr)
                 if not sec_ok:
                     log(f"  REJECT Tier A {sym} security: {sec_reason}")
                     acted[addr] = time.time()
                     save_acted(acted)
                     continue
-                log(f"ENTER TIER_A {sym} ${size} | MC=${mc:.0f} | {strength} {n_wallets}w")
+                # v5.1: K1 pump guard
+                if check_k1_pump(addr, sym):
+                    log(f"  SKIP Tier A {sym}: K1 pump guard")
+                    continue
+                # v5.1: TOP_ZONE filter
+                cur_price_pre = get_token_price(addr)
+                if cur_price_pre and check_top_zone(addr, cur_price_pre, sym):
+                    log(f"  SKIP Tier A {sym}: TOP_ZONE filter")
+                    continue
+                log(f"ENTER TIER_A {sym} ${size} | MC=${mc:.0f} | {strength} {n_wallets}w | conf={confidence}")
                 ok_swap, _ = execute_swap(USDC_ADDR, addr, size)
                 if ok_swap:
                     entry_price = get_token_price(addr)
@@ -976,6 +1230,10 @@ def main():
                         "tp2_done":      False,
                         "tp3_done":      False,
                         "holders_at_entry": 0,
+                        "peak_price":    entry_price,
+                        "last_liq_check": 0,
+                        "zero_price_count": 0,
+                        "confidence":    confidence,
                     }
                     acted[addr] = time.time()
                     save_acted(acted)
@@ -999,7 +1257,12 @@ def main():
                     continue
                 if is_acted(acted, addr) or addr in positions:
                     continue
-                ok, size = entry_guard(positions, daily_state, usdc, "B")
+                # v5.1: cooldown dedup
+                if time.time() < cooldown_until.get(addr, 0):
+                    remaining = cooldown_until[addr] - time.time()
+                    log(f"  COOLDOWN: {sym} skip {remaining:.0f}s left")
+                    continue
+                ok, size = entry_guard(positions, daily_state, usdc, "B", addr=addr)
                 if not ok:
                     log(f"  SKIP Tier B {sym}: {size}")
                     continue
@@ -1025,6 +1288,9 @@ def main():
                         "tp2_done":      False,
                         "holders_at_entry": 0,
                         "bonding_at_entry": bonding,
+                        "peak_price":    entry_price,
+                        "last_liq_check": 0,
+                        "zero_price_count": 0,
                     }
                     acted[addr] = time.time()
                     save_acted(acted)
@@ -1049,12 +1315,17 @@ def main():
                     continue
                 if is_acted(acted, addr) or addr in positions:
                     continue
+                # v5.1: cooldown dedup
+                if time.time() < cooldown_until.get(addr, 0):
+                    remaining = cooldown_until[addr] - time.time()
+                    log(f"  COOLDOWN: {sym} skip {remaining:.0f}s left")
+                    continue
                 # Tier C 连续亏损冷却检查
                 if time.time() < daily_state["tier_c_pause_until"]:
                     remaining = daily_state["tier_c_pause_until"] - time.time()
                     log(f"  SKIP Tier C: cooldown {remaining/60:.0f}min left")
                     break
-                ok, size = entry_guard(positions, daily_state, usdc, "C")
+                ok, size = entry_guard(positions, daily_state, usdc, "C", addr=addr)
                 if not ok:
                     log(f"  SKIP Tier C {sym}: {size}")
                     continue
@@ -1078,6 +1349,9 @@ def main():
                         "tier":            "TIER_C",
                         "tp1_done":        False,
                         "holders_at_entry": holders,
+                        "peak_price":      entry_price,
+                        "last_liq_check":  0,
+                        "zero_price_count": 0,
                     }
                     acted[addr] = time.time()
                     save_acted(acted)
