@@ -28,22 +28,30 @@ MAX_POSITIONS  = 6
 #   流动性>$100k 后涨>100% 接近 0%，流动性$5k-20k 涨幅最佳
 #   MAX_SM 不设上限（热门大meme SM很多但仍然值得跟）
 #   soldRatio<35% 才是真正早期信号（>35% 聪明钱已大量离场）
-OKX_INFLOW_MIN    = 1000   # hot-tokens inflowUsd 最低 $1000
-OKX_RISK_MAX      = 1      # riskLevelControl <= 1
+# ── 参数 v4.5：基于320样本+2小时复盘综合优化 ──────────────────────────────
+# 复盘发现：sold>35%是最大障碍（12/12错过），top10>25%拦了6个，MC>500k拦了3个
+# soldRatio 完全不可信（signal list 数据是历史数据，早已>35%）
+# 改为只依赖 hot-tokens 路径A + inflowUsd 作为主信号
+OKX_INFLOW_MIN    = 500    # inflowUsd 降至 $500（放宽抓更多早期机会）
+OKX_RISK_MAX      = 2      # risk<=2（risk=2不算高风险，扩大候选池）
 MIN_SM_WALLETS    = 3      # 至少3个SM钱包
-MAX_SOLD_RATIO    = 35     # soldRatio < 35%（真正早期信号）
-MIN_MC            = 50000  # 最小市值 $50k（<$50k 死亡率>50%）
-MAX_MC            = 500000 # 最大市值 $500k（$50k-500k 是最优区间）
-MIN_LIQ           = 5000   # 最低流动性 $5k（$5k-20k 是最佳涨幅区间）
-MAX_LIQ           = 100000 # 最高流动性 $100k（>$100k 涨>100% 接近0%）
-MAX_BUNDLE        = 50     # bundle宽松（不是淘汰条件）
+MAX_SOLD_RATIO    = 85     # soldRatio 放宽（路径B降级为辅助，主要靠路径A）
+MIN_MC            = 50000  # 最小市值 $50k（数据验证：<$50k 死亡率>50%）
+MAX_MC            = 1500000 # 最大市值 $1.5M（Bear $534k、Bucky $572k 涨幅好）
+MIN_LIQ           = 5000   # 最低流动性 $5k
+MAX_LIQ           = 200000 # 最高流动性 $200k（Bear/wobbles 流动性>100k 仍然涨）
+MAX_BUNDLE        = 50     # bundle宽松
 MAX_RUG_RATIO     = 0.25
-MAX_TOP10         = 0.25   # top10 < 25%（数据显示25%以下最优）
-DEV_MUST_CLOSE    = True   # creator_close 强制（65个样本100%验证）
+MAX_TOP10         = 0.35   # top10 < 35%（从25%放宽，top10>25%拦了6个好币）
+DEV_MUST_CLOSE    = True   # creator_close 强制
 REQUIRE_DUAL_SRC  = False
 KLINE_HIGH_PCT    = 0.95
 KLINE_VOL_PCT     = 0.80
 KLINE_AGE_SKIP    = 600
+
+# 仓位配置：少出手但每笔要准，用户要求高质量大仓位
+POS_NORMAL        = 8      # 普通信号：8U
+POS_STRONG        = 12     # 强信号：12U（inflowUsd>$5000 或 change>50%）
 
 LOG_FILE = "/tmp/meme_hunter_v4.log"
 ACTED_FILE = "/tmp/meme_hunter_acted.json"  # 已处理地址持久化文件
@@ -84,18 +92,23 @@ def get_safety_line():
         return SAFETY_LINE_NIGHT
     return SAFETY_LINE
 
-def get_max_position(usdc):
-    """根据余额和时间确定仓位大小"""
+def get_max_position(usdc, is_strong=False):
+    """
+    仓位大小：少出手但每笔要准
+    普通信号：8U
+    强信号（inflowUsd>5000 或 change>50%）：12U
+    晚间更保守
+    """
     night = is_night_time()
     if night:
-        # 晚间更保守
-        if usdc > 170: return 2
-        if usdc > 150: return 1
-        return 0  # 晚间安全线触发，不开仓
+        if usdc > 170: return 3
+        if usdc > 150: return 2
+        return 0
     else:
-        if usdc > 150: return MAX_POSITION
-        if usdc > 120: return 2
-        return 1
+        base = POS_STRONG if is_strong else POS_NORMAL
+        if usdc > 150: return base
+        if usdc > 120: return max(3, base // 2)
+        return 3
 
 # ─── OKX热门榜缓存（每5分钟刷新一次）──────────────────────────────────────────
 _hot_tokens_cache = {}
@@ -147,7 +160,7 @@ def get_hot_token_candidates(hot_data):
         sym    = info.get('sym', '?')
         liq    = info.get('liq', 0)
 
-        if inflow < 1000: continue
+        if inflow < OKX_INFLOW_MIN: continue
         if change < 5: continue
         if top10 > MAX_TOP10 * 100: continue
         if not (MIN_MC < mc < MAX_MC): continue
@@ -676,7 +689,7 @@ def main():
     log(f"Day safety: ${SAFETY_LINE} | Night safety: ${SAFETY_LINE_NIGHT}")
     log(f"Signal: inflowUsd>${OKX_INFLOW_MIN} + risk<={OKX_RISK_MAX} + SM>={MIN_SM_WALLETS} + soldRatio<{MAX_SOLD_RATIO}%")
     log(f"MC: ${MIN_MC}-${MAX_MC} | liq: ${MIN_LIQ}-${MAX_LIQ} | top10<{MAX_TOP10:.0%} | DEV_MUST_CLOSE: {DEV_MUST_CLOSE}")
-    log(f"TP: +50%卖75% | +150%再卖50% | +300%再卖50% | SL: -40%+SM出货清仓 | 超时48h清仓 | 重试3次")
+    log(f"仓位: 普通${POS_NORMAL} | 强信号${POS_STRONG} | 持仓检查3s | TP:+50%→75% +150%→50% +300%→50% | SL:-40%+SM | 重试3次")
     log("=" * 60)
 
     event_queue = queue.Queue()
@@ -720,8 +733,8 @@ def main():
             time.sleep(30)
             continue
 
-        # 持仓检查（每10秒，meme价格变化快）
-        if now - last_position_check > 10:
+        # 持仓检查（每3秒，meme价格变化极快）
+        if now - last_position_check > 3:
             check_and_tp(positions)
             last_position_check = now
 
@@ -815,10 +828,14 @@ def main():
 
             log(f"  PASS | {reason2}")
 
-            pos_size = get_max_position(usdc)
+            # 强信号判断：inflowUsd>$5000 或 change>50%
+            is_strong = (sig.get('inflow', 0) > 5000 or sig.get('change', 0) > 50)
+            pos_size = get_max_position(usdc, is_strong=is_strong)
             if pos_size == 0:
                 log(f"  SKIP: night mode, position size=0")
                 continue
+            if is_strong:
+                log(f"  💪 强信号 inflow=${sig.get('inflow',0):.0f} change={sig.get('change',0):.1f}% → 仓位${pos_size}")
 
             ok3, tx = execute_swap(addr, sym, pos_size)
             if ok3:
