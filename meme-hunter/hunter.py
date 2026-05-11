@@ -649,6 +649,8 @@ def fetch_new_tokens():
             continue
         if dev_hold != 0:
             continue
+        if mc < 3000:   # MC 至少 $3000，过滤极小垃圾币
+            continue
         if holders < 2:
             continue
         if buy_tx <= 5:
