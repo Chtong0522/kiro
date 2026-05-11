@@ -46,6 +46,7 @@ KLINE_VOL_PCT     = 0.80
 KLINE_AGE_SKIP    = 600
 
 LOG_FILE = "/tmp/meme_hunter_v4.log"
+ACTED_FILE = "/tmp/meme_hunter_acted.json"  # 已处理地址持久化文件
 os.environ["PATH"] = "/home/ubuntu/.local/bin:/home/ubuntu/.nvm/versions/node/v22.22.2/bin:" + os.environ.get("PATH", "")
 
 def log(msg):
@@ -453,6 +454,27 @@ def execute_swap(addr, sym, amount, is_sell=False):
     log(f"  swap failed: {out[:200]}")
     return False, ""
 
+def load_acted():
+    """从文件加载已处理地址，防止重启后重复买入"""
+    try:
+        if os.path.exists(ACTED_FILE):
+            with open(ACTED_FILE, "r") as f:
+                data = json.load(f)
+                acted = set(data.get("acted", []))
+                log(f"  acted加载: {len(acted)}个已处理地址")
+                return acted
+    except Exception as e:
+        log(f"  acted加载失败: {e}")
+    return set()
+
+def save_acted(acted):
+    """保存已处理地址到文件"""
+    try:
+        with open(ACTED_FILE, "w") as f:
+            json.dump({"acted": list(acted)}, f)
+    except Exception as e:
+        log(f"  acted保存失败: {e}")
+
 def get_usdc_balance():
     out = run("onchainos wallet balance --chain solana")
     d = jparse(out)
@@ -574,7 +596,8 @@ def check_and_tp(positions):
         elif pnl >= -0.4: tag = "⚠️ 亏损"
         else:              tag = "🛑 -40%+"
 
-        log(f"  {tag} {sym}: 入场${amt_usd:.1f}({amt_tokens:.0f}枚) 现值${cur_val:.2f} PnL={pnl:+.1%}(${pnl_usd:+.2f}) age={age_h:.1f}h [{src}]")
+        multiplier = 1 + pnl
+        log(f"  {tag} {sym}: 入场${amt_usd:.1f}({amt_tokens:.0f}枚) 现值${cur_val:.2f} {multiplier:.2f}x PnL={pnl:+.1%}(${pnl_usd:+.2f}) age={age_h:.1f}h [{src}]")
 
         # ── TP1: +50% → 卖 75% ────────────────────────────────────────────────
         if pnl >= 0.50 and not pos.get("tp1_done"):
@@ -660,7 +683,9 @@ def main():
     aggregator  = SignalAggregator()
     ws_listener = WSListener(event_queue)
     positions   = load_existing_positions()
-    acted       = set(positions.keys())  # 已接管的地址不重复建仓
+    acted       = load_acted()
+    acted.update(positions.keys())  # 已接管的地址也加入 acted，防止重复建仓
+    save_acted(acted)
 
     # 启动 WebSocket
     if not ws_listener.start_sessions():
@@ -695,8 +720,8 @@ def main():
             time.sleep(30)
             continue
 
-        # 持仓检查（每5分钟）
-        if now - last_position_check > 300:
+        # 持仓检查（每10秒，meme价格变化快）
+        if now - last_position_check > 10:
             check_and_tp(positions)
             last_position_check = now
 
@@ -797,16 +822,26 @@ def main():
 
             ok3, tx = execute_swap(addr, sym, pos_size)
             if ok3:
+                # 立即查询买入价格记录，用于止盈止损计算
+                price_out = run(f"onchainos token price-info --address {addr} --chain solana", timeout=10)
+                price_d = jparse(price_out)
+                entry_price = sf(price_d.get("data", {}).get("price"))
+                # 估算买入的 token 数量
+                amount_tokens = (pos_size / entry_price) if entry_price > 0 else 0
                 positions[addr] = {
                     "sym": sym, "amount_usd": pos_size,
-                    "entry_time": time.time(), "entry_price": 0,
+                    "amount_tokens": amount_tokens,
+                    "entry_time": time.time(), "entry_price": entry_price,
                     "source": src
                 }
+                log(f"  entry_price=${entry_price:.8f} amount_tokens={amount_tokens:.0f}")
                 acted.add(addr)
+                save_acted(acted)
                 usdc -= pos_size
                 log(f"  ENTERED {sym} ${pos_size} | USDC left: ${usdc:.1f}")
             else:
                 acted.add(addr)
+                save_acted(acted)
 
             time.sleep(3)
 
