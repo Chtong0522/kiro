@@ -22,16 +22,24 @@ MAX_POSITIONS  = 6
 # ── OKX战场专属参数（基于真实数据校准）─────────────────────────────────────────
 # 核心信号：OKX signal list + OKX hot-tokens inflowUsd
 # 验证数据：inflowUsd>0 涨组100% vs 跌组0%
-OKX_INFLOW_MIN    = 1000   # hot-tokens inflowUsd 最低 $1000（净买入确认）
-OKX_RISK_MAX      = 1      # riskLevelControl <= 1（OKX官方低风险认证）
-MIN_SM_WALLETS    = 1      # fallback 模式每 token 只出现一次，count=1
-MAX_SOLD_RATIO    = 85     # 放宽（signal list 普遍 60-95%，聪明钱陆续出是正常的）
-MIN_MC            = 50000  # 最小市值 $50k（OKX战场现实MC门槛）
-MAX_MC            = 5000000 # 最大市值 $5M
-MAX_BUNDLE        = 50     # bundle不是淘汰条件，仅过滤极端情况
+# ── 参数（基于320个样本数据分析最终版 v4.1）──────────────────────────────────
+# 核心数据发现：
+#   SM 3-29 + MC $50k-500k + liq $5k-100k + top10<25% → 死亡率25%，涨>100% 17%
+#   流动性>$100k 后涨>100% 接近 0%，流动性$5k-20k 涨幅最佳
+#   MAX_SM 不设上限（热门大meme SM很多但仍然值得跟）
+#   soldRatio<35% 才是真正早期信号（>35% 聪明钱已大量离场）
+OKX_INFLOW_MIN    = 1000   # hot-tokens inflowUsd 最低 $1000
+OKX_RISK_MAX      = 1      # riskLevelControl <= 1
+MIN_SM_WALLETS    = 3      # 至少3个SM钱包
+MAX_SOLD_RATIO    = 35     # soldRatio < 35%（真正早期信号）
+MIN_MC            = 50000  # 最小市值 $50k（<$50k 死亡率>50%）
+MAX_MC            = 500000 # 最大市值 $500k（$50k-500k 是最优区间）
+MIN_LIQ           = 5000   # 最低流动性 $5k（$5k-20k 是最佳涨幅区间）
+MAX_LIQ           = 100000 # 最高流动性 $100k（>$100k 涨>100% 接近0%）
+MAX_BUNDLE        = 50     # bundle宽松（不是淘汰条件）
 MAX_RUG_RATIO     = 0.25
-MAX_TOP10         = 0.40   # top10 < 40%（SM高倍币实测均值17%）
-DEV_MUST_CLOSE    = True   # creator_close强制要求（100%验证）
+MAX_TOP10         = 0.25   # top10 < 25%（数据显示25%以下最优）
+DEV_MUST_CLOSE    = True   # creator_close 强制（65个样本100%验证）
 REQUIRE_DUAL_SRC  = False
 KLINE_HIGH_PCT    = 0.95
 KLINE_VOL_PCT     = 0.80
@@ -140,10 +148,10 @@ def get_hot_token_candidates(hot_data):
 
         if inflow < 1000: continue
         if change < 5: continue
-        if top10 > 40: continue
-        if not (30000 < mc < 5000000): continue
-        if risk > 1: continue
-        if liq < 5000: continue
+        if top10 > MAX_TOP10 * 100: continue
+        if not (MIN_MC < mc < MAX_MC): continue
+        if risk > OKX_RISK_MAX: continue
+        if not (MIN_LIQ <= liq <= MAX_LIQ): continue
 
         candidates.append({
             'addr': addr, 'sym': sym, 'mc': mc,
@@ -218,6 +226,7 @@ class SignalAggregator:
 
         if not (MIN_MC < mc < MAX_MC):
             return
+        # 流动性在 add_event 时无法获取，在 gate_check 里验证
 
         with self.lock:
             if addr not in self.signals:
@@ -323,6 +332,12 @@ def gate_check(addr, hot_data=None, source='signal'):
         if top10_hot > MAX_TOP10 * 100:  # hot-tokens 用百分比值
             return False, f"G0:top10={top10_hot:.1f}%"
 
+    # Gate 0.5: 流动性检查（数据验证：liq>$100k 后涨>100% 接近0%）
+    if hot_data and addr in hot_data:
+        liq = hot_data[addr].get('liq', 0)
+        if liq > 0 and not (MIN_LIQ <= liq <= MAX_LIQ):
+            return False, f"G0:liq=${liq:.0f} out of ${MIN_LIQ}-${MAX_LIQ}"
+
     # Gate 1: 蜜罐
     out = run(f"onchainos security token-scan --tokens '501:{addr}'", timeout=20)
     d = jparse(out)
@@ -406,17 +421,32 @@ def kline_check(addr, token_open_ts=0):
     return True, f"{pct_h:.0%}ofHigh vol={vol_r:.0%}"
 
 # ─── 交易执行 ─────────────────────────────────────────────────────────────────
-def execute_swap(addr, sym, amount):
-    cmd = (
-        f"onchainos swap execute "
-        f"--from {USDC_ADDR} --to {addr} "
-        f"--readable-amount {amount} "
-        f"--chain solana --wallet {WALLET} "
-        f"--gas-level fast --slippage 15"
-    )
+def execute_swap(addr, sym, amount, is_sell=False):
+    """
+    买入：USDC → token
+    卖出：token → USDC（amount 是 USDC 价值，用比例计算 token 数量）
+    """
+    if is_sell or "_SELL" in sym:
+        # 卖出：from=token, to=USDC
+        cmd = (
+            f"onchainos swap execute "
+            f"--from {addr} --to {USDC_ADDR} "
+            f"--readable-amount {amount} "
+            f"--chain solana --wallet {WALLET} "
+            f"--gas-level fast --slippage 15"
+        )
+    else:
+        # 买入：from=USDC, to=token
+        cmd = (
+            f"onchainos swap execute "
+            f"--from {USDC_ADDR} --to {addr} "
+            f"--readable-amount {amount} "
+            f"--chain solana --wallet {WALLET} "
+            f"--gas-level fast --slippage 15"
+        )
     out = run(cmd, timeout=90)
-    d = jparse(out)
-    tx = d.get("data", {}).get("swapTxHash", "")
+    d   = jparse(out)
+    tx  = d.get("data", {}).get("swapTxHash", "")
     if tx:
         log(f"  TX: https://solscan.io/tx/{tx}")
         return True, tx
@@ -433,34 +463,90 @@ def get_usdc_balance():
 
 # ─── 持仓管理 ─────────────────────────────────────────────────────────────────
 def check_and_tp(positions):
+    """
+    止盈策略：宁可少赚，不能犯错
+    +50% → 卖75%，留25%底仓
+    +150% → 再卖底仓的50%（此时已是纯利润）
+    +300% → 卖剩余的50%，只留极少底仓飞
+    止损：-40% 且聪明钱出货 → 清仓
+    超时：持仓>48h 无动作 → 清仓
+    """
     if not positions:
         return
     log(f"Checking {len(positions)} positions...")
     for addr, pos in list(positions.items()):
-        sym = pos["sym"]
-        entry = pos.get("entry_price", 0)
-        if not entry:
+        sym        = pos["sym"]
+        entry      = pos.get("entry_price", 0)
+        amount_usd = pos.get("amount_usd", 0)
+        if not entry or not amount_usd:
             continue
+
         out = run(f"onchainos token price-info --address {addr} --chain solana", timeout=15)
-        d = jparse(out)
+        d   = jparse(out)
         cur = sf(d.get("data", {}).get("price"))
         if not cur:
             continue
-        pnl = (cur - entry) / entry
-        age_h = (time.time() - pos["entry_time"]) / 3600
-        log(f"  {sym}: PnL={pnl:+.1%} age={age_h:.1f}h")
 
-        if pnl >= 0.60 and not pos.get("tp1"):
-            log(f"  TP1 +60% {sym}")
-            pos["tp1"] = True
-        if pnl >= 1.50 and not pos.get("tp2"):
-            log(f"  TP2 +150% {sym}")
-            pos["tp2"] = True
-        if pnl >= 3.00 and not pos.get("tp3"):
-            log(f"  TP3 +300% {sym}")
-            pos["tp3"] = True
-        if age_h > 48:
-            log(f"  Time stop {sym}")
+        pnl   = (cur - entry) / entry
+        age_h = (time.time() - pos["entry_time"]) / 3600
+        log(f"  {sym}: PnL={pnl:+.1%} age={age_h:.1f}h entry=${entry:.8f} cur=${cur:.8f}")
+
+        # TP1：+50% → 卖75%，留25%底仓（宁可少赚，保住利润）
+        if pnl >= 0.50 and not pos.get("tp1"):
+            sell_amt = amount_usd * 0.75
+            log(f"  🎯 TP1 +50% {sym} — sell 75% (${sell_amt:.1f}), keep 25% floor")
+            ok, tx = execute_swap(addr, sym + "_SELL", sell_amt)
+            if ok:
+                pos["tp1"]        = True
+                pos["amount_usd"] = amount_usd * 0.25
+                log(f"  TP1 done, floor=${pos['amount_usd']:.1f}U")
+
+        # TP2：+150% → 再卖底仓50%（此时已是纯利润在飞）
+        elif pnl >= 1.50 and pos.get("tp1") and not pos.get("tp2"):
+            sell_amt = pos["amount_usd"] * 0.50
+            log(f"  🎯 TP2 +150% {sym} — sell 50% of floor (${sell_amt:.1f})")
+            ok, tx = execute_swap(addr, sym + "_SELL", sell_amt)
+            if ok:
+                pos["tp2"]        = True
+                pos["amount_usd"] = pos["amount_usd"] * 0.50
+                log(f"  TP2 done, floor=${pos['amount_usd']:.1f}U")
+
+        # TP3：+300% → 卖剩余50%，只留极少底仓
+        elif pnl >= 3.00 and pos.get("tp2") and not pos.get("tp3"):
+            sell_amt = pos["amount_usd"] * 0.50
+            log(f"  🎯 TP3 +300% {sym} — sell 50% of remaining (${sell_amt:.1f})")
+            ok, tx = execute_swap(addr, sym + "_SELL", sell_amt)
+            if ok:
+                pos["tp3"]        = True
+                pos["amount_usd"] = pos["amount_usd"] * 0.50
+                log(f"  TP3 done, moonbag=${pos['amount_usd']:.1f}U")
+
+        # 止损：-40% 且 SM 出货 → 清仓
+        elif pnl <= -0.40 and not pos.get("tp1"):
+            log(f"  🛑 Stop loss {sym} PnL={pnl:+.1%} — checking SM exit...")
+            out5 = run(
+                f"gmgn-cli token traders --chain sol --address {addr} "
+                f"--tag smart_degen --order-by sell_volume_cur --direction desc --limit 5 --raw",
+                timeout=20
+            )
+            d5 = jparse(out5)
+            traders = d5.get("list", [])
+            if traders:
+                top = traders[0]
+                sv = sf(top.get("sell_volume_cur"))
+                bv = sf(top.get("buy_volume_cur"))
+                if bv > 0 and sv > bv * 1.3:
+                    log(f"  🛑 SM exiting confirmed, closing {sym}")
+                    del positions[addr]
+                    break
+                else:
+                    log(f"  SM not exiting (sv=${sv:.0f} bv=${bv:.0f}), holding")
+            else:
+                log(f"  No SM data, holding despite loss")
+
+        # 超时止损：48h 无动作
+        if age_h > 48 and addr in positions:
+            log(f"  ⏰ Time stop {sym} ({age_h:.0f}h)")
             del positions[addr]
             break
 
@@ -470,8 +556,9 @@ def main():
     log("SOL MEME HUNTER v4 — OKX战场专属版")
     log(f"Wallet: {WALLET}")
     log(f"Day safety: ${SAFETY_LINE} | Night safety: ${SAFETY_LINE_NIGHT}")
-    log(f"Signal: OKX inflowUsd>${OKX_INFLOW_MIN} + riskLevel<={OKX_RISK_MAX} + SM>={MIN_SM_WALLETS}")
-    log(f"MC: ${MIN_MC}-${MAX_MC} | DEV_MUST_CLOSE: {DEV_MUST_CLOSE} (hot-path only) | MAX_SOLD_RATIO: {MAX_SOLD_RATIO}%")
+    log(f"Signal: inflowUsd>${OKX_INFLOW_MIN} + risk<={OKX_RISK_MAX} + SM>={MIN_SM_WALLETS} + soldRatio<{MAX_SOLD_RATIO}%")
+    log(f"MC: ${MIN_MC}-${MAX_MC} | liq: ${MIN_LIQ}-${MAX_LIQ} | top10<{MAX_TOP10:.0%} | DEV_MUST_CLOSE: {DEV_MUST_CLOSE}")
+    log(f"TP: +50%→sell75% | +150%→sell50%floor | +300%→sell50%remain | SL: -40%+SM_exit")
     log("=" * 60)
 
     event_queue = queue.Queue()
