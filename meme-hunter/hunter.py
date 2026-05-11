@@ -461,59 +461,189 @@ def get_usdc_balance():
             return float(a.get("balance", 0))
     return 0
 
+def load_existing_positions():
+    """
+    持仓接管：启动时扫描钱包已有 token 余额，自动注入 positions
+    跳过 USDC 和 SOL（原生币），其余视为待管理持仓
+    """
+    log("=== 持仓接管：扫描已有持仓 ===")
+    positions = {}
+    out = run("onchainos wallet balance --chain solana")
+    d = jparse(out)
+    assets = d.get("data", {}).get("details", [{}])[0].get("tokenAssets", [])
+    skip_syms = {"USDC", "SOL", "WSOL"}
+    for a in assets:
+        sym     = a.get("symbol", "?")
+        addr    = a.get("tokenContractAddress", "")
+        bal     = sf(a.get("balance", 0))
+        val_usd = sf(a.get("usdValue", 0))
+        if sym in skip_syms or not addr or val_usd < 0.5:
+            continue
+        # 获取当前价格作为 entry_price（接管时无法知道原始买入价，用当前价代替）
+        out2 = run(f"onchainos token price-info --address {addr} --chain solana", timeout=15)
+        d2   = jparse(out2)
+        cur  = sf(d2.get("data", {}).get("price"))
+        positions[addr] = {
+            "sym":          sym,
+            "amount_usd":   val_usd,
+            "amount_tokens": bal,
+            "entry_price":  cur if cur > 0 else 0,
+            "entry_time":   time.time() - 3600,  # 假设持仓1小时（保守估计）
+            "source":       "takeover",
+        }
+        log(f"  接管 {sym}: {bal:.2f}枚 ~${val_usd:.2f} addr={addr[:12]}...")
+    log(f"  接管完成，共 {len(positions)} 个持仓")
+    return positions
+
 # ─── 持仓管理 ─────────────────────────────────────────────────────────────────
+def sell_token(addr, sym, amount_tokens, reason, max_retries=3):
+    """
+    严格执行卖出，失败自动重试最多3次
+    amount_tokens: 要卖出的 token 数量
+    """
+    for attempt in range(1, max_retries + 1):
+        log(f"  💸 [{attempt}/{max_retries}] 卖出 {sym} {amount_tokens:.2f} tokens | 原因: {reason}")
+        cmd = (
+            f"onchainos swap execute "
+            f"--from {addr} --to {USDC_ADDR} "
+            f"--readable-amount {amount_tokens:.6f} "
+            f"--chain solana --wallet {WALLET} "
+            f"--gas-level fast --slippage 15"
+        )
+        out = run(cmd, timeout=90)
+        d = jparse(out)
+        tx = d.get("data", {}).get("swapTxHash", "")
+        if tx:
+            log(f"  ✅ 卖出成功 {sym} | TX: https://solscan.io/tx/{tx}")
+            return True, tx
+        err = out[:150] if out else "无返回"
+        log(f"  ❌ 卖出失败 [{attempt}/{max_retries}] {sym} | {err}")
+        if attempt < max_retries:
+            time.sleep(5 * attempt)  # 递增等待：5s、10s
+    log(f"  🚨 卖出彻底失败 {sym}，已重试{max_retries}次，需人工处理")
+    return False, ""
+
+
 def check_and_tp(positions):
     """
-    持仓监控：只记录盈亏状态，不自动执行止盈止损
-    人工根据日志决定是否手动操作
+    持仓监控 + 严格自动止盈止损
+    策略：
+      TP1: +50%  → 自动卖出 75%，保留 25% 底仓（零成本）
+      TP2: +150% → 再卖底仓的 50%
+      TP3: +300% → 再卖剩余 50%，只留极少底仓飞
+      SL:  -40%  → 查 SM 是否出货，确认则清仓；未出货则继续持有
+      超时: >48h 无动作 → 全清仓
+    每档止盈/止损失败最多重试 3 次
     """
     if not positions:
         return
     log(f"=== 持仓检查 ({len(positions)}个) ===")
     for addr, pos in list(positions.items()):
-        sym       = pos["sym"]
-        entry     = pos.get("entry_price", 0)
-        amt_usd   = pos.get("amount_usd", 0)
-        age_h     = (time.time() - pos["entry_time"]) / 3600
-        src       = pos.get("source", "?")
+        sym        = pos["sym"]
+        entry      = pos.get("entry_price", 0)
+        amt_usd    = pos.get("amount_usd", 0)
+        amt_tokens = pos.get("amount_tokens", 0)
+        age_h      = (time.time() - pos["entry_time"]) / 3600
+        src        = pos.get("source", "?")
 
+        # 获取当前价格
         out = run(f"onchainos token price-info --address {addr} --chain solana", timeout=15)
         d   = jparse(out)
         cur = sf(d.get("data", {}).get("price"))
 
-        if entry > 0 and cur > 0:
-            pnl     = (cur - entry) / entry
-            pnl_usd = amt_usd * pnl
-            cur_val = amt_usd * (1 + pnl)
+        if not cur or not entry or not amt_tokens:
+            log(f"  ❓ {sym}: 无法获取价格或无持仓数据 age={age_h:.1f}h [{src}]")
+            # 超时仍然清仓
+            if age_h > 48 and amt_tokens > 0 and not pos.get("timeout_done"):
+                log(f"  ⏰ 超时清仓 {sym} ({age_h:.0f}h)")
+                ok, _ = sell_token(addr, sym, amt_tokens, "超时>48h清仓")
+                if ok:
+                    pos["timeout_done"] = True
+                    del positions[addr]
+            continue
 
-            # 状态标签
-            if pnl >= 3.0:   tag = "🚀 +300%+"
-            elif pnl >= 1.5: tag = "🎯 +150%+"
-            elif pnl >= 0.5: tag = "✅ +50%+"
-            elif pnl >= 0.0: tag = "📈 盈利"
-            elif pnl >= -0.4: tag = "⚠️ 亏损"
-            else:             tag = "🛑 -40%+"
+        pnl     = (cur - entry) / entry
+        pnl_usd = amt_usd * pnl
+        cur_val = amt_tokens * cur
 
-            log(f"  {tag} {sym}: 入场${amt_usd:.1f} → 现值${cur_val:.2f} PnL={pnl:+.1%}(${pnl_usd:+.2f}) age={age_h:.1f}h [{src}]")
+        # 状态标签
+        if pnl >= 3.0:    tag = "🚀 +300%+"
+        elif pnl >= 1.5:  tag = "🎯 +150%+"
+        elif pnl >= 0.5:  tag = "✅ +50%+"
+        elif pnl >= 0.0:  tag = "📈 盈利"
+        elif pnl >= -0.4: tag = "⚠️ 亏损"
+        else:              tag = "🛑 -40%+"
 
-            # 提醒（不执行）
-            if pnl >= 0.50 and not pos.get("tp1_alerted"):
-                log(f"  ⚡ 提醒: {sym} 已达 +50% 止盈线，建议手动卖出75%")
-                pos["tp1_alerted"] = True
-            if pnl >= 1.50 and not pos.get("tp2_alerted"):
-                log(f"  ⚡ 提醒: {sym} 已达 +150% 止盈线，建议手动再卖50%底仓")
-                pos["tp2_alerted"] = True
-            if pnl >= 3.00 and not pos.get("tp3_alerted"):
-                log(f"  ⚡ 提醒: {sym} 已达 +300% 止盈线，建议手动再卖50%")
-                pos["tp3_alerted"] = True
-            if pnl <= -0.40 and not pos.get("sl_alerted"):
-                log(f"  ⚡ 提醒: {sym} 已达 -40% 止损线，建议手动检查是否清仓")
-                pos["sl_alerted"] = True
-            if age_h > 48 and not pos.get("timeout_alerted"):
-                log(f"  ⚡ 提醒: {sym} 持仓超48h，建议手动评估是否清仓")
-                pos["timeout_alerted"] = True
-        else:
-            log(f"  ❓ {sym}: 无法获取价格 age={age_h:.1f}h [{src}]")
+        log(f"  {tag} {sym}: 入场${amt_usd:.1f}({amt_tokens:.0f}枚) 现值${cur_val:.2f} PnL={pnl:+.1%}(${pnl_usd:+.2f}) age={age_h:.1f}h [{src}]")
+
+        # ── TP1: +50% → 卖 75% ────────────────────────────────────────────────
+        if pnl >= 0.50 and not pos.get("tp1_done"):
+            sell_amt = amt_tokens * 0.75
+            log(f"  🎯 TP1触发 +{pnl:.0%} → 卖出75% ({sell_amt:.0f}枚)")
+            ok, _ = sell_token(addr, sym, sell_amt, f"TP1 +{pnl:.0%}")
+            if ok:
+                pos["tp1_done"]    = True
+                pos["amount_tokens"] = amt_tokens * 0.25
+                pos["amount_usd"]  = amt_usd * 0.25
+                log(f"  TP1完成，底仓剩 {pos['amount_tokens']:.0f}枚 (${pos['amount_usd']:.1f})")
+
+        # ── TP2: +150% → 再卖底仓50% ──────────────────────────────────────────
+        elif pnl >= 1.50 and pos.get("tp1_done") and not pos.get("tp2_done"):
+            sell_amt = pos["amount_tokens"] * 0.50
+            log(f"  🎯 TP2触发 +{pnl:.0%} → 再卖底仓50% ({sell_amt:.0f}枚)")
+            ok, _ = sell_token(addr, sym, sell_amt, f"TP2 +{pnl:.0%}")
+            if ok:
+                pos["tp2_done"]    = True
+                pos["amount_tokens"] = pos["amount_tokens"] * 0.50
+                pos["amount_usd"]  = pos["amount_usd"] * 0.50
+                log(f"  TP2完成，底仓剩 {pos['amount_tokens']:.0f}枚 (${pos['amount_usd']:.1f})")
+
+        # ── TP3: +300% → 再卖剩余50%，留极少底仓 ─────────────────────────────
+        elif pnl >= 3.00 and pos.get("tp2_done") and not pos.get("tp3_done"):
+            sell_amt = pos["amount_tokens"] * 0.50
+            log(f"  🎯 TP3触发 +{pnl:.0%} → 再卖50% ({sell_amt:.0f}枚)")
+            ok, _ = sell_token(addr, sym, sell_amt, f"TP3 +{pnl:.0%}")
+            if ok:
+                pos["tp3_done"]    = True
+                pos["amount_tokens"] = pos["amount_tokens"] * 0.50
+                pos["amount_usd"]  = pos["amount_usd"] * 0.50
+                log(f"  TP3完成，月球底仓 {pos['amount_tokens']:.0f}枚 (${pos['amount_usd']:.1f})")
+
+        # ── SL: -40% → 检查SM出货，确认则清仓 ────────────────────────────────
+        elif pnl <= -0.40 and not pos.get("tp1_done") and not pos.get("sl_done"):
+            log(f"  🛑 SL触发 {pnl:.0%} → 检查SM是否出货...")
+            out5 = run(
+                f"gmgn-cli token traders --chain sol --address {addr} "
+                f"--tag smart_degen --order-by sell_volume_cur --direction desc --limit 5 --raw",
+                timeout=20
+            )
+            d5 = jparse(out5)
+            traders = d5.get("list", [])
+            sm_exiting = False
+            if traders:
+                top = traders[0]
+                sv = sf(top.get("sell_volume_cur"))
+                bv = sf(top.get("buy_volume_cur"))
+                sm_exiting = bv > 0 and sv > bv * 1.3
+                log(f"  SM状态: sell=${sv:.0f} buy=${bv:.0f} → {'出货中' if sm_exiting else '未出货'}")
+
+            if sm_exiting:
+                log(f"  🛑 SM出货确认，清仓 {sym}")
+                ok, _ = sell_token(addr, sym, pos["amount_tokens"], f"SL {pnl:.0%}+SM出货")
+                if ok:
+                    pos["sl_done"] = True
+                    del positions[addr]
+                    continue
+            else:
+                log(f"  ⏸ SM未出货，继续持有 {sym} (pnl={pnl:.0%})")
+
+        # ── 超时止损: >48h 无任何止盈触发 → 清仓 ─────────────────────────────
+        if age_h > 48 and addr in positions and not pos.get("tp1_done") and not pos.get("timeout_done"):
+            log(f"  ⏰ 超时清仓 {sym} ({age_h:.0f}h，无止盈触发)")
+            ok, _ = sell_token(addr, sym, pos["amount_tokens"], f"超时{age_h:.0f}h")
+            if ok:
+                pos["timeout_done"] = True
+                del positions[addr]
 
 # ─── 主程序 ────────────────────────────────────────────────────────────────────
 def main():
@@ -523,14 +653,14 @@ def main():
     log(f"Day safety: ${SAFETY_LINE} | Night safety: ${SAFETY_LINE_NIGHT}")
     log(f"Signal: inflowUsd>${OKX_INFLOW_MIN} + risk<={OKX_RISK_MAX} + SM>={MIN_SM_WALLETS} + soldRatio<{MAX_SOLD_RATIO}%")
     log(f"MC: ${MIN_MC}-${MAX_MC} | liq: ${MIN_LIQ}-${MAX_LIQ} | top10<{MAX_TOP10:.0%} | DEV_MUST_CLOSE: {DEV_MUST_CLOSE}")
-    log(f"止盈止损: 仅监控提醒，不自动执行，需手动操作")
+    log(f"TP: +50%卖75% | +150%再卖50% | +300%再卖50% | SL: -40%+SM出货清仓 | 超时48h清仓 | 重试3次")
     log("=" * 60)
 
     event_queue = queue.Queue()
     aggregator  = SignalAggregator()
     ws_listener = WSListener(event_queue)
-    positions   = {}
-    acted       = set()
+    positions   = load_existing_positions()
+    acted       = set(positions.keys())  # 已接管的地址不重复建仓
 
     # 启动 WebSocket
     if not ws_listener.start_sessions():
