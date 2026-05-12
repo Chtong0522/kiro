@@ -580,7 +580,6 @@ def process_tier_a():
         symbol = token.get("symbol", "?")
         wallet_count = safe_int(sig.get("triggerWalletCount", 0))
         sold_ratio = safe_float(sig.get("soldRatioPercent", 100))
-        mc = safe_float(token.get("marketCap", 0))
 
         if not addr or addr in _NEVER_TRADE:
             continue
@@ -592,8 +591,7 @@ def process_tier_a():
 
         # Pre-filter from signal data
         if sold_ratio > 80:
-            continue
-        if mc < config.TIER_A_MC_MIN or mc > config.TIER_A_MC_MAX:
+            feed(f"  SKIP_A {symbol}: soldRatio={sold_ratio:.0f}%")
             continue
 
         # Signal strength classification
@@ -606,37 +604,42 @@ def process_tier_a():
             if inflow <= 0:
                 continue
 
-        # Deep verification
+        # Fetch real MC/liq/holders from price-info (signal list often returns MC=0)
         try:
-            price_info = get_token_price(addr)
-            liq = safe_float(price_info.get("liquidity", 0))
-            holders = safe_int(price_info.get("holders", 0))
-            price = safe_float(price_info.get("price", 0))
-
-            if liq < config.TIER_A_LIQ_MIN:
-                continue
-            if holders < config.TIER_A_HOLDERS_MIN:
-                continue
-
-            # K1 pump guard
-            if _k1_pump_guard(addr, config.TIER_A_K1_PUMP_GUARD):
-                feed(f"  Skip {symbol}: K1 pump guard")
-                continue
-
-            # Risk check
-            rc = pre_trade_checks(addr, symbol, quick=True)
-            if not rc.get("pass", False):
-                feed(f"  Skip {symbol}: risk G{rc.get('grade', '?')}")
-                continue
-
+            price_data = get_token_price(addr)
+            mc = safe_float(price_data.get("marketCap", 0))
+            liq = safe_float(price_data.get("liquidity", 0))
+            holders = safe_int(price_data.get("holders", 0))
+            price = safe_float(price_data.get("price", 0))
         except Exception as e:
-            feed(f"  Skip {symbol}: verification error: {e}")
+            feed(f"  SKIP_A {symbol}: price-info error: {e}")
+            continue
+
+        if mc < config.TIER_A_MC_MIN or mc > config.TIER_A_MC_MAX:
+            feed(f"  SKIP_A {symbol}: MC=${mc:,.0f} (need ${config.TIER_A_MC_MIN:,}-${config.TIER_A_MC_MAX:,})")
+            continue
+        if liq < config.TIER_A_LIQ_MIN:
+            feed(f"  SKIP_A {symbol}: liq=${liq:,.0f} (need ${config.TIER_A_LIQ_MIN:,})")
+            continue
+        if holders < config.TIER_A_HOLDERS_MIN:
+            feed(f"  SKIP_A {symbol}: holders={holders} (need {config.TIER_A_HOLDERS_MIN})")
+            continue
+
+        # K1 pump guard
+        if _k1_pump_guard(addr, config.TIER_A_K1_PUMP_GUARD):
+            feed(f"  SKIP_A {symbol}: K1 pump guard")
+            continue
+
+        # Risk check
+        rc = pre_trade_checks(addr, symbol, quick=True)
+        if not rc.get("pass", False):
+            feed(f"  SKIP_A {symbol}: risk G{rc.get('grade', '?')}")
             continue
 
         # Entry check
         ok, reason = can_enter()
         if not ok:
-            feed(f"  Skip {symbol}: {reason}")
+            feed(f"  SKIP_A {symbol}: {reason}")
             return
 
         # Execute buy
@@ -909,7 +912,7 @@ def process_tier_d():
         mc = safe_float(tok.get("marketCap", 0) or tok.get("usdMarketCap", 0))
         liq = safe_float(tok.get("liquidity", 0) or tok.get("liquidityUsd", 0))
         top10 = safe_float(tok.get("top10HoldPercent", 0) or tok.get("top10Percent", 0))
-        risk_level = safe_int(tok.get("riskLevel", 99) or tok.get("riskControlLevel", 99))
+        risk_level = safe_int(tok.get("riskLevelControl", tok.get("riskLevel", 99)))
         inflow = safe_float(tok.get("inflowUsd", 0) or tok.get("netInflowUsd", 0) or tok.get("inflow", 0))
         change = safe_float(tok.get("change", 0) or tok.get("priceChange", 0) or tok.get("changePct", 0))
         traders = safe_int(tok.get("uniqueTraders", 0) or tok.get("traderCount", 0))

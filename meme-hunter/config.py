@@ -120,8 +120,8 @@ TIER_D_LIQ_MIN         = 30_000      # 最低流动性 $30K | Min liquidity $30K
 TIER_D_TOP10_MAX       = 35.0        # Top10持仓上限 35% | Top10 holdings max 35%
 TIER_D_RISK_LEVEL      = 1           # 风险等级必须=1 (最低) | Risk level must be 1 (lowest)
 TIER_D_MIN_INFLOW      = 0           # 净流入>0 (正向资金流) | Net inflow > 0 (positive flow)
-TIER_D_MIN_CHANGE      = 5.0         # 价格变化>5% (有动量) | Price change > 5% (has momentum)
-TIER_D_UNIQUE_TRADERS  = 100         # 独立交易者>=100 | Unique traders >= 100
+TIER_D_MIN_CHANGE      = 0.0         # 允许持平或上涨 (净流入>0已经确认方向) | Allow flat or rising (inflow>0 confirms direction)
+TIER_D_UNIQUE_TRADERS  = 0            # 热门币API不返回此字段,禁用 | Hot tokens API doesn't return this field, disabled
 
 # ── Take Profit / 止盈策略 ─────────────────────────────────────────────────
 # 每层独立止盈规则 | Per-tier TP rules
