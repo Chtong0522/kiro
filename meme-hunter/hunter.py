@@ -59,7 +59,7 @@ MAX_BONDING    = 97
 MAX_INSIDERS   = 30
 MAX_TOP10_B    = 40
 TIER_B_MIN_MC      = 12000   # MIGRATING tokens MC range is $12k-$29k
-TIER_B_MIN_HOLDERS = 30      # Reduced from 50
+TIER_B_MIN_HOLDERS = 100     # 至少 100 持币地址，低于此风险过大
 TIER_B_MIN_APED    = 1       # Reduced from 2
 
 # Tier C 过滤（EARLY MIGRATING 早期毕业预埋）— 30-65% bonding 区间
@@ -67,7 +67,7 @@ MIN_BONDING_C        = 30     # 早期毕业前段
 MAX_BONDING_C        = 65     # 还没到冲刺阶段
 TIER_C_MIN_MC        = 5000   # MC 至少 $5000
 TIER_C_MAX_MC        = 15000  # MC 最多 $15000（小市值早期）
-TIER_C_MIN_HOLDERS   = 20     # 至少 20 个持币地址
+TIER_C_MIN_HOLDERS   = 100    # 至少 100 个持币地址，低于此不买
 TIER_C_MIN_BUY_TX    = 5      # 至少 5 笔买单
 TIER_C_TIMEOUT_MIN   = 30     # 超时 30 分钟（early MIGRATING 需要时间）
 
@@ -197,8 +197,8 @@ def load_acted():
                 data = raw
             else:
                 data = {}
-            # 过期 12h (43200s) 的条目
-            cleaned = {addr: ts for addr, ts in data.items() if now - float(ts) < 43200}
+            # 不过期 — 同一个币买过就不再买（防止重复买入造成巨大亏损）
+            cleaned = data
             log(f"  acted 加载: {len(cleaned)} 个有效记录 (共{len(data)})")
             return cleaned
     except Exception as e:
@@ -216,10 +216,8 @@ def save_acted(acted):
 
 
 def is_acted(acted, addr):
-    """检查地址是否在 acted 中且未过期（12h）"""
-    if addr not in acted:
-        return False
-    return time.time() - float(acted[addr]) < 43200
+    """检查地址是否在 acted 中 — 永不过期，买过就不再买"""
+    return addr in acted
 
 
 # ─── 余额与价格 ───────────────────────────────────────────────────────────────
@@ -1206,6 +1204,10 @@ def main():
     log(f"Existing positions: {len(positions)}")
     log("=" * 60)
 
+    # 启动冷却期：前 180 秒只监控持仓，不开新仓（防止重启时立即买入）
+    startup_time = time.time()
+    STARTUP_COOLDOWN = 180  # 3 分钟
+
     while True:
         now = time.time()
         reset_daily_if_needed(daily_state)
@@ -1219,8 +1221,8 @@ def main():
             )
             last_balance_check = now
 
-        # 持仓检查（每 3s）
-        if now - last_pos_check > 3:
+        # 持仓检查（每 1s — 加速止损反应）
+        if now - last_pos_check > 1:
             check_positions(positions, daily_state)
             last_pos_check = now
 
@@ -1237,6 +1239,14 @@ def main():
                 log(f"🚨 DAILY LOSS LIMIT HIT: ${daily_state['realized_pnl']:.2f} — 需重启脚本才能恢复交易")
             log(f"HALTED: 日亏损熔断，请重启脚本恢复 | PnL=${daily_state['realized_pnl']:.2f}")
             time.sleep(60)
+            continue
+
+        # 启动冷却期：前 3 分钟只监控，不开新仓
+        if now - startup_time < STARTUP_COOLDOWN:
+            elapsed = now - startup_time
+            if int(elapsed) % 30 == 0:  # 每 30 秒提示一次
+                log(f"  STARTUP_COOLDOWN: {STARTUP_COOLDOWN - elapsed:.0f}s remaining, monitoring only")
+            time.sleep(2)
             continue
 
         # Hot-tokens 缓存刷新（每 HOT_REFRESH 秒）
@@ -1394,6 +1404,7 @@ def main():
                     save_acted(acted)
                     usdc -= size
                     log(f"  ENTERED Tier B {sym} ${size} | USDC left: ${usdc:.1f}")
+                    break  # 每轮最多买入 1 个 Tier B，避免一次性连买
                 else:
                     acted[addr] = time.time()
                     save_acted(acted)
@@ -1465,6 +1476,7 @@ def main():
                     usdc -= size
                     daily_state["tier_c_count"] = daily_state.get("tier_c_count", 0) + 1
                     log(f"  ENTERED Tier C {sym} ${size} | USDC left: ${usdc:.1f}")
+                    break  # 每轮最多买入 1 个 Tier C，避免一次性连买
                 else:
                     acted[addr] = time.time()
                     save_acted(acted)
