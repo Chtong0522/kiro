@@ -1,1752 +1,1841 @@
 #!/usr/bin/env python3
 """
-SOL Meme Hunter v5 — 三层预测架构
+SOL Meme Hunter v6.0 - Production Trading Bot
+Architecture: 3-Tier (A/B/D) with dynamic scoring and session risk control.
+Swap flow: swap swap -> contract-call -> wallet history (proper 3-step flow).
 
-v5 vs v4.5 核心改变：
-  v4.5 追涨逻辑：等 hot-tokens inflowUsd 出现才买 → 信号已经滞后，追高亏损
-  v5 预判逻辑：在价格爆发前埋伏，三层流水线：
-    Tier A（智能钱包跟单）：onchainos tracker activities 实时追踪 SM 钱包聚集买入信号
-              多钱包 10 分钟内同步买入 → 强信号直接买；单钱包 → 需 hot-tokens 确认
-    Tier B（MIGRATING 毕业伏击）：bonding curve 70-97% 时埋伏，等待毕业后价格爆发
-              dev 已售出 + insiders<30% + top10<40% + 交易活跃 = 健康毕业候选
-    Tier C（NEW 机器人触发抢跑）：bonding 3-10% 极早期，dev 已抛 + 极少持有者
-              3 分钟内不涨就全清，快进快出抢机器人买盘
+Tiers:
+  A - Smart Money Signal (onchainos signal list)
+  B - Graduation Ambush (onchainos memepump tokens --stage MIGRATED)
+  D - Hot Momentum (onchainos token hot-tokens --ranking-type 4)
 
-  三层联动：Tier A 作为涨势确认，Tier B/C 作为早期布局
-  夜间（UTC 14-22）Tier C 禁止，Tier A/B 仓位缩减
+Dashboard: http://localhost:3250
 """
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 1: Imports & Setup
+# ══════════════════════════════════════════════════════════════════════════════
 
 import subprocess
 import json
 import time
 import os
+import threading
+import signal
+import sys
+import random
+import string
+from pathlib import Path
 from datetime import datetime, timezone
+from collections import defaultdict
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-os.environ["PATH"] = "/home/ubuntu/.local/bin:/home/ubuntu/.nvm/versions/node/v22.22.2/bin:" + os.environ.get("PATH", "")
+import config
+from risk_check import pre_trade_checks, post_trade_flags
 
-# ─── 核心常量 ────────────────────────────────────────────────────────────────
-WALLET    = "AXBCfbioEHiJ48ejNp5feEzWt2iHFLUDNMk27t5vXWLE"
-USDC_ADDR = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-LOG_FILE  = "/tmp/meme_hunter_v4.log"
-ACTED_FILE = "/tmp/meme_hunter_acted.json"
-SESSION_FILE = "/tmp/meme_hunter_session.json"
+# Ensure onchainos CLI is on PATH
+os.environ["PATH"] = (
+    os.path.expanduser("~/.local/bin") + ":"
+    + os.path.expanduser("~/.nvm/versions/node/v22.22.2/bin") + ":"
+    + os.environ.get("PATH", "")
+)
 
-# 安全熔断
-SAFETY_LINE_DAY   = 80
-SAFETY_LINE_NIGHT = 150
-DAILY_LOSS_LIMIT  = 15   # 触发后需重启才能恢复（不会自动日重置）
-MAX_POSITIONS     = 6
-MAX_TIER_C_DAY    = 4
-TIER_C_COOLDOWN   = 7200  # 2小时冷却（连续2次亏损后）
-
-# 仓位大小
-TIER_A_SIZE  = 8
-TIER_B_SIZE  = 5
-TIER_C_SIZE  = 3
-TIER_A_NIGHT = 5
-TIER_B_NIGHT = 3
-
-# Tier A 过滤（智能钱包跟单）
-SM_MIN_MC    = 50000
-SM_MAX_MC    = 2000000
-SM_MIN_LIQ   = 5000
-SM_MAX_LIQ   = 200000
-SM_WINDOW    = 600   # 10 分钟内多钱包信号视为强信号
-
-# Tier B 过滤（MIGRATING 毕业伏击）
-MIN_BONDING    = 90
-MAX_BONDING    = 97
-MAX_INSIDERS   = 30
-MAX_TOP10_B    = 40
-TIER_B_MIN_MC      = 12000   # MIGRATING tokens MC range is $12k-$29k
-TIER_B_MIN_HOLDERS = 50      # 降低门槛，配合 breakthrough 逻辑
-TIER_B_MIN_APED    = 1       # Reduced from 2
-
-# Tier C 过滤（EARLY MIGRATING 早期毕业预埋）— 30-65% bonding 区间
-MIN_BONDING_C        = 30     # 早期毕业前段
-MAX_BONDING_C        = 65     # 还没到冲刺阶段
-TIER_C_MIN_MC        = 5000   # MC 至少 $5000
-TIER_C_MAX_MC        = 15000  # MC 最多 $15000（小市值早期）
-TIER_C_MIN_HOLDERS   = 80     # 降低至 80，配合动态仓位评分
-TIER_C_MIN_BUY_TX    = 5      # 至少 5 笔买单
-TIER_C_TIMEOUT_MIN   = 30     # 超时 30 分钟（early MIGRATING 需要时间）
-
-# 刷新间隔（秒）
-HOT_REFRESH       = 300
-SM_REFRESH        = 30
-MIGRATING_REFRESH = 60
-NEW_REFRESH       = 15
-
-# Tier D 过滤（HOT MOMENTUM 热门动量）
-TIER_D_SIZE         = 5
-TIER_D_NIGHT        = 3
-TIER_D_MIN_HOLDERS  = 500
-TIER_D_MIN_MC       = 100000
-TIER_D_MAX_MC       = 10000000
-TIER_D_MIN_LIQ      = 30000
-TIER_D_MAX_TOP10    = 35
-TIER_D_MIN_TRADERS  = 100
-
-# ─── v5.1 策略常量 ────────────────────────────────────────────────────────────
-# 追踪止损：TP1 后从峰值回撤触发清仓
-TRAIL_DISTANCE_A = 0.12   # 12% drawdown from peak after TP1 → exit Tier A
-TRAIL_DISTANCE_B = 0.10   # 10% drawdown from peak after TP1 → exit Tier B
-
-# 时间衰减止损：持仓时间过长但未达硬止损时提前离场
-# Fix 2: 60min threshold must be less negative (stricter) than 30min — exit if still underwater at all
-TIME_DECAY_SL = [(30, -0.08), (60, -0.01)]  # (minutes_held, pnl_threshold)
-
-# 会话连续亏损熔断
-SESSION_CONSEC_LOSS_MAX = 3
-SESSION_CONSEC_PAUSE    = 600   # 10 分钟
+PROJECT_DIR = Path(__file__).parent
+SOL_NATIVE = config.SOL_NATIVE
+_NEVER_TRADE = getattr(config, "_NEVER_TRADE_MINTS", set())
+_startup_ts = time.time()
 
 
-# ─── v5.1 模块级状态 ──────────────────────────────────────────────────────────
-# 信号冷却去重：卖出后 30 分钟内不重新买同一 token
-cooldown_until: dict = {}
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 2: State Management
+# ══════════════════════════════════════════════════════════════════════════════
 
-# 会话连续亏损状态
-session_state = {'consecutive_losses': 0, 'pause_until': 0.0}
+state_lock = threading.Lock()
+pos_lock = threading.Lock()
+trades_lock = threading.Lock()
+
+cooldown_map = {}       # {addr: expire_timestamp}
+_selling = set()        # prevent concurrent sells of the same token
+_wallet_addr = ""       # cached wallet address
+
+state = {
+    "positions": {},
+    "trades": [],
+    "feed": [],
+    "stats": {
+        "cycle": 0, "buys": 0, "sells": 0,
+        "wins": 0, "losses": 0, "net_pnl": 0.0,
+    },
+}
+
+session_risk = {
+    "consecutive_losses": 0,
+    "cumulative_loss_usd": 0.0,
+    "paused_until": 0,
+    "stopped": False,
+}
+
+acted = {}  # {addr: timestamp} - permanent, never buy same token twice
 
 
-def load_session_state():
-    """加载 session_state，如文件不存在则返回默认值"""
+def load_positions():
+    """Load positions from disk."""
     try:
-        if os.path.exists(SESSION_FILE):
-            with open(SESSION_FILE, "r") as f:
-                data = json.load(f)
-            # Reset pause_until if it already expired (don't re-apply stale pauses)
-            if data.get('pause_until', 0) < time.time():
-                data['pause_until'] = 0.0
-            return data
-    except Exception:
-        pass
-    return {'consecutive_losses': 0, 'pause_until': 0.0}
+        with open(config.POSITIONS_FILE) as f:
+            state["positions"] = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        state["positions"] = {}
 
 
-def save_session_state():
-    """保存 session_state 到磁盘"""
+def save_positions():
+    """Atomic write positions. Caller must hold pos_lock."""
+    tmp = config.POSITIONS_FILE + ".tmp"
     try:
-        with open(SESSION_FILE, "w") as f:
-            json.dump(session_state, f)
+        with open(tmp, "w") as f:
+            json.dump(state["positions"], f, default=str, indent=2)
+        os.replace(tmp, config.POSITIONS_FILE)
     except Exception:
         pass
 
 
-# ─── 工具函数 ────────────────────────────────────────────────────────────────
+def load_trades():
+    """Load trade history from disk."""
+    try:
+        with open(config.TRADES_FILE) as f:
+            state["trades"] = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        state["trades"] = []
 
-def log(msg):
-    """带时间戳输出到 LOG_FILE 和 stdout"""
+
+def save_trades():
+    """Atomic write trade history. Caller must hold trades_lock."""
+    tmp = config.TRADES_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(state["trades"], f, default=str, indent=2)
+        os.replace(tmp, config.TRADES_FILE)
+    except Exception:
+        pass
+
+
+def load_acted():
+    """Load acted tokens (permanent - never buy same token again)."""
+    global acted
+    try:
+        with open(config.ACTED_FILE) as f:
+            acted = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        acted = {}
+
+
+def save_acted():
+    """Write acted file atomically."""
+    tmp = config.ACTED_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(acted, f, default=str)
+        os.replace(tmp, config.ACTED_FILE)
+    except Exception:
+        pass
+
+
+def load_session():
+    """Load session risk state."""
+    global session_risk
+    try:
+        with open(config.SESSION_FILE) as f:
+            data = json.load(f)
+            session_risk.update(data)
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+
+def save_session():
+    """Write session risk state atomically."""
+    tmp = config.SESSION_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(session_risk, f, default=str)
+        os.replace(tmp, config.SESSION_FILE)
+    except Exception:
+        pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 3: Utility Functions
+# ══════════════════════════════════════════════════════════════════════════════
+
+def feed(msg):
+    """Log message to stdout, file, and state feed list."""
     ts = datetime.now().strftime("%H:%M:%S")
     line = f"[{ts}] {msg}"
     print(line, flush=True)
     try:
-        with open(LOG_FILE, "a") as f:
+        with open(config.LOG_FILE, "a") as f:
             f.write(line + "\n")
     except Exception:
         pass
+    with state_lock:
+        state["feed"].append({"msg": msg, "t": ts})
+        state["feed"] = state["feed"][-50:]
 
 
-def run(cmd, timeout=30):
-    """执行 shell 命令，返回 stdout.strip() 或空字符串"""
+def safe_float(v, default=0.0):
+    """Safe float conversion."""
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
-        return r.stdout.strip()
+        return float(v)
+    except (ValueError, TypeError):
+        return default
+
+
+def safe_int(v, default=0):
+    """Safe int conversion."""
+    try:
+        return int(v)
+    except (ValueError, TypeError):
+        return default
+
+
+def is_night():
+    """Check if current UTC hour is in night mode range."""
+    h = datetime.now(timezone.utc).hour
+    if config.NIGHT_START_UTC < config.NIGHT_END_UTC:
+        return config.NIGHT_START_UTC <= h < config.NIGHT_END_UTC
+    else:
+        return h >= config.NIGHT_START_UTC or h < config.NIGHT_END_UTC
+
+
+def onchainos_run(*args, timeout=20):
+    """Run onchainos CLI command. Returns full parsed JSON dict."""
+    try:
+        r = subprocess.run(
+            ["onchainos", *args],
+            capture_output=True, text=True, timeout=timeout
+        )
+        return json.loads(r.stdout)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "msg": "timeout", "data": None}
+    except (json.JSONDecodeError, Exception):
+        return {"ok": False, "msg": "parse_error", "data": None}
+
+
+def onchainos_data(*args, timeout=20):
+    """Run onchainos CLI command, return .data field."""
+    result = onchainos_run(*args, timeout=timeout)
+    return result.get("data")
+
+
+def get_wallet_address():
+    """Get Solana wallet address. Caches result."""
+    global _wallet_addr
+    if _wallet_addr:
+        return _wallet_addr
+    try:
+        data = onchainos_data("wallet", "addresses", "--chain", "501")
+        if isinstance(data, dict):
+            sol_addrs = data.get("solana", [])
+            if sol_addrs and isinstance(sol_addrs, list):
+                _wallet_addr = sol_addrs[0].get("address", "")
+        elif isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    ci = item.get("chainIndex")
+                    if ci in (501, "501"):
+                        _wallet_addr = item.get("address", "")
+                        break
+        if not _wallet_addr:
+            _wallet_addr = config.WALLET
     except Exception:
-        return ""
+        _wallet_addr = config.WALLET
+    return _wallet_addr
 
 
-def jparse(raw):
-    """安全 JSON 解析，出错返回 {}"""
+def get_sol_balance():
+    """Get native SOL balance in SOL units."""
     try:
-        return json.loads(raw)
+        data = onchainos_data("wallet", "balance", "--chain", "501")
+        if isinstance(data, dict):
+            details = data.get("details", [])
+            if isinstance(details, list):
+                for detail in details:
+                    assets = detail.get("tokenAssets", [])
+                    if isinstance(assets, list):
+                        for a in assets:
+                            ta = a.get("tokenAddress")
+                            sym = (a.get("symbol") or "").upper()
+                            if ta in ("", None) or sym == "SOL":
+                                return safe_float(a.get("balance", 0))
+            ta = data.get("tokenAddress")
+            if ta in ("", None):
+                return safe_float(data.get("balance", 0))
+        elif isinstance(data, list):
+            for b in data:
+                ta = b.get("tokenAddress")
+                sym = (b.get("symbol") or "").upper()
+                if ta in ("", None) or sym == "SOL":
+                    return safe_float(b.get("balance", 0))
     except Exception:
-        return {}
+        pass
+    return 0.0
 
 
-def sf(v):
-    """安全 float 转换，出错返回 0"""
+def get_sol_price():
+    """Get current SOL price in USD."""
     try:
-        return float(v) if v is not None else 0.0
+        data = onchainos_data("token", "price-info", "--chain", "solana",
+                              "--address", SOL_NATIVE)
+        if isinstance(data, list):
+            for item in data:
+                p = safe_float(item.get("price", 0))
+                if p > 0:
+                    return p
+        elif isinstance(data, dict):
+            p = safe_float(data.get("price", 0))
+            if p > 0:
+                return p
     except Exception:
-        return 0.0
-
-
-def is_night_time():
-    """UTC 14:00-22:00 为夜间模式（北京时间 22:00-06:00）"""
-    utc_hour = datetime.now(timezone.utc).hour
-    return 14 <= utc_hour < 22
-
-
-def get_safety_line():
-    """根据时间段返回安全线"""
-    return SAFETY_LINE_NIGHT if is_night_time() else SAFETY_LINE_DAY
-
-
-# ─── acted 持久化 ─────────────────────────────────────────────────────────────
-
-def load_acted():
-    """
-    加载已处理地址，自动过期超过 12 小时的记录。
-    返回 dict {addr: timestamp}
-    """
-    try:
-        if os.path.exists(ACTED_FILE):
-            with open(ACTED_FILE, "r") as f:
-                raw = json.load(f)
-            now = time.time()
-            # 兼容旧格式（set/list）和新格式（dict）
-            if isinstance(raw, dict) and "acted" in raw:
-                # 旧格式：{"acted": [...]}
-                entries = raw["acted"]
-                if isinstance(entries, list):
-                    data = {addr: now for addr in entries}
-                else:
-                    data = entries
-            elif isinstance(raw, dict):
-                data = raw
-            else:
-                data = {}
-            # 不过期 — 同一个币买过就不再买（防止重复买入造成巨大亏损）
-            cleaned = data
-            log(f"  acted 加载: {len(cleaned)} 个有效记录 (共{len(data)})")
-            return cleaned
-    except Exception as e:
-        log(f"  acted 加载失败: {e}")
-    return {}
-
-
-def save_acted(acted):
-    """保存 acted dict 到文件"""
-    try:
-        with open(ACTED_FILE, "w") as f:
-            json.dump(acted, f)
-    except Exception as e:
-        log(f"  acted 保存失败: {e}")
-
-
-def is_acted(acted, addr):
-    """检查地址是否在 acted 中 — 永不过期，买过就不再买"""
-    return addr in acted
-
-
-# ─── 余额与价格 ───────────────────────────────────────────────────────────────
-
-def get_usdc_balance():
-    """查询 USDC 余额，返回 float"""
-    out = run("onchainos wallet balance --chain solana", timeout=20)
-    d = jparse(out)
-    assets = d.get("data", {}).get("details", [{}])
-    if assets:
-        for a in assets[0].get("tokenAssets", []):
-            if a.get("symbol") == "USDC":
-                return sf(a.get("balance", 0))
+        pass
     return 0.0
 
 
 def get_token_price(addr):
-    """查询 token 当前价格，返回 float 或 0"""
-    out = run(f"onchainos token price-info --address {addr} --chain solana", timeout=15)
-    d = jparse(out)
-    data = d.get("data", {})
-    # API 可能返回 dict 或 list
-    if isinstance(data, list):
-        if data:
-            return sf(data[0].get("price", 0))
-        return 0.0
-    if isinstance(data, dict):
-        return sf(data.get("price", 0))
+    """Get token price info. Returns dict with price, marketCap, liquidity, holders."""
+    try:
+        data = onchainos_data("token", "price-info", "--chain", "solana",
+                              "--address", addr)
+        if isinstance(data, list):
+            return data[0] if data else {}
+        elif isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def get_token_balance(wallet_addr, token_addr):
+    """Get token balance for a specific token in wallet."""
+    try:
+        data = onchainos_data("portfolio", "token-balances",
+                              "--address", wallet_addr,
+                              "--tokens", f"501:{token_addr}")
+        if isinstance(data, list) and data:
+            item = data[0]
+            return safe_float(item.get("amount", 0))
+        elif isinstance(data, dict):
+            return safe_float(data.get("amount", 0))
+    except Exception:
+        pass
     return 0.0
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 4: Swap Execution Engine
+# ══════════════════════════════════════════════════════════════════════════════
 
-def load_existing_positions():
+def poll_tx_status(tx_hash, timeout=60):
+    """Poll transaction status. Returns 'confirmed', 'failed', or 'timeout'."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            data = onchainos_data("wallet", "history",
+                                  "--tx-hash", tx_hash,
+                                  "--chain-index", "501", timeout=15)
+            if data:
+                status = ""
+                if isinstance(data, dict):
+                    status = (data.get("status") or "").lower()
+                elif isinstance(data, list) and data:
+                    status = (data[0].get("status") or "").lower()
+                if status in ("confirmed", "success", "complete"):
+                    return "confirmed"
+                if status in ("failed", "error", "reverted"):
+                    return "failed"
+        except Exception:
+            pass
+        time.sleep(3)
+    return "timeout"
+
+
+def execute_buy(token_addr, amount_usd):
     """
-    持仓接管：启动时扫描钱包，跳过 USDC/SOL/WSOL，
-    其余 token 注入 positions，tier='takeover'，entry_time=now-3600
+    Buy token using proper 3-step swap flow.
+    amount_usd: position size in USD
+    Returns: (success: bool, tx_hash: str, token_amount: float)
     """
-    log("=== 持仓接管：扫描已有持仓 ===")
-    positions = {}
-    out = run("onchainos wallet balance --chain solana", timeout=20)
-    d = jparse(out)
-    assets = d.get("data", {}).get("details", [{}])
-    if not assets:
-        log("  持仓接管：未获取到余额数据")
-        return positions
-    skip_syms = {"USDC", "SOL", "WSOL"}
-    for a in assets[0].get("tokenAssets", []):
-        sym     = a.get("symbol", "?")
-        addr    = a.get("tokenContractAddress", "")
-        bal     = sf(a.get("balance", 0))
-        val_usd = sf(a.get("usdValue", 0))
-        if sym in skip_syms or not addr or val_usd < 0.5:
-            continue
-        entry_price = 0
-        for _try in range(3):
-            entry_price = get_token_price(addr)
-            if entry_price > 0:
-                break
-            time.sleep(1)
-        if entry_price <= 0:
-            log(f"  WARN: {sym} takeover price=0 after 3 retries, storing entry_price=0 amt_tokens=0")
-        positions[addr] = {
-            "sym":           sym,
-            "amount_usd":    val_usd,
-            "amount_tokens": bal,
-            "entry_price":   entry_price if entry_price > 0 else 0.0,
-            "entry_time":    time.time() - 3600,
-            "tier":          "takeover",
-            "tp1_done":      False,
-            "tp2_done":      False,
-            "tp3_done":      False,
-            "holders_at_entry": 0,
-            "peak_price":    entry_price if entry_price > 0 else 0.0,
-            "last_liq_check": 0,
-            "zero_price_count": 0,
-        }
-        log(f"  接管 {sym}: {bal:.2f}枚 ~${val_usd:.2f} entry=${entry_price:.8f} addr={addr[:12]}...")
-    log(f"  接管完成，共 {len(positions)} 个持仓")
-    return positions
+    wallet = get_wallet_address()
+    if not wallet:
+        feed("  BUY FAIL: no wallet address")
+        return False, "", 0.0
+
+    # Paper trade mode: use quote only
+    if config.PAPER_TRADE:
+        sol_price = get_sol_price()
+        if sol_price <= 0:
+            return False, "", 0.0
+        lamports = int(amount_usd / sol_price * 1e9)
+        try:
+            data = onchainos_data("swap", "quote",
+                                  "--from", SOL_NATIVE,
+                                  "--to", token_addr,
+                                  "--amount", str(lamports),
+                                  "--chain", "solana", timeout=30)
+            if not data:
+                return False, "", 0.0
+            q = data[0] if isinstance(data, list) else data
+            router = q.get("routerResult", q)
+            token_amount = safe_float(router.get("toTokenAmount", 0))
+            return True, "paper_" + str(int(time.time())), token_amount
+        except Exception as e:
+            feed(f"  BUY QUOTE FAIL: {e}")
+            return False, "", 0.0
+
+    # Step 1: Get SOL price, convert USD to lamports
+    sol_price = get_sol_price()
+    if sol_price <= 0:
+        feed("  BUY FAIL: cannot get SOL price")
+        return False, "", 0.0
+    lamports = int(amount_usd / sol_price * 1e9)
+
+    # Step 2: onchainos swap swap
+    try:
+        data = onchainos_data("swap", "swap",
+                              "--chain", "solana",
+                              "--from", SOL_NATIVE,
+                              "--to", token_addr,
+                              "--amount", str(lamports),
+                              "--slippage", str(config.SLIPPAGE_BUY),
+                              "--wallet", wallet,
+                              timeout=60)
+        if not data:
+            feed("  BUY FAIL: swap returned no data")
+            return False, "", 0.0
+    except Exception as e:
+        feed(f"  BUY FAIL swap: {e}")
+        return False, "", 0.0
+
+    q = data[0] if isinstance(data, list) else data
+    router = q.get("routerResult", q)
+    token_amount = safe_float(router.get("toTokenAmount", 0))
+
+    # Step 3: Extract tx.to and tx.data, call contract-call
+    tx = q.get("tx", {})
+    tx_to = tx.get("to", "")
+    unsigned_tx = tx.get("data", "")
+
+    if not tx_to or not unsigned_tx:
+        feed("  BUY FAIL: swap response missing tx.to or tx.data")
+        return False, "", 0.0
+
+    try:
+        result = onchainos_data("wallet", "contract-call",
+                                "--chain", "501",
+                                "--to", tx_to,
+                                "--unsigned-tx", unsigned_tx,
+                                timeout=60)
+        if not result:
+            feed("  BUY FAIL: contract-call returned no data")
+            return False, "", 0.0
+    except Exception as e:
+        feed(f"  BUY FAIL contract-call: {e}")
+        # Timeout - create unconfirmed position
+        if "timeout" in str(e).lower():
+            return False, "TIMEOUT", token_amount
+        return False, "", 0.0
+
+    tx_hash = ""
+    if isinstance(result, dict):
+        tx_hash = result.get("txHash") or result.get("orderId") or ""
+    elif isinstance(result, str):
+        tx_hash = result
+
+    # Step 4: Poll for confirmation (non-blocking, short timeout)
+    if tx_hash:
+        status = poll_tx_status(tx_hash, timeout=30)
+        if status == "failed":
+            feed(f"  BUY FAIL: tx {tx_hash[:12]} failed on-chain")
+            return False, tx_hash, 0.0
+        # confirmed or timeout - both OK (timeout = unconfirmed position)
+
+    # If token_amount is 0, try to get it from balance
+    if token_amount <= 0 and tx_hash:
+        time.sleep(2)
+        token_amount = get_token_balance(wallet, token_addr)
+
+    return True, tx_hash, token_amount
 
 
-# ─── 每日 PnL 状态 ────────────────────────────────────────────────────────────
-
-def reset_daily_if_needed(daily_state):
-    """检查 UTC 日期，新的一天则重置 daily_state（注意：halted 标志不重置，需重启清除）"""
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if daily_state["date"] != today:
-        log(f"  新的一天 {today}，重置 daily_state（昨日 PnL={daily_state['realized_pnl']:+.2f}）")
-        daily_state["date"] = today
-        daily_state["realized_pnl"] = 0.0
-        daily_state["tier_c_count"] = 0
-        daily_state["tier_c_consecutive_losses"] = 0
-        daily_state["tier_c_pause_until"] = 0.0
-        # halted 标志不重置 — 需要人工重启脚本才能恢复
-
-
-def add_realized_pnl(daily_state, pnl_usd):
-    """记录已实现 PnL"""
-    daily_state["realized_pnl"] += pnl_usd
-    log(f"  已实现 PnL 更新: {pnl_usd:+.2f} → 今日合计 {daily_state['realized_pnl']:+.2f}")
-
-
-# ─── 交易执行 ─────────────────────────────────────────────────────────────────
-
-def sell_token(addr, sym, amount_tokens, reason, max_retries=3):
+def execute_sell(token_addr, symbol, token_amount, reason, max_retries=3):
     """
-    执行卖出，失败自动重试最多 max_retries 次，退避 5/10/15 秒。
-    返回 (True, tx_hash) 或 (False, '')
+    Sell token using proper 3-step swap flow with retry logic.
+    token_amount: raw amount in token's smallest units
+    Returns: (success: bool, tx_hash: str)
     """
-    for attempt in range(1, max_retries + 1):
-        log(f"  sell [{attempt}/{max_retries}] {sym} {amount_tokens:.6f} tokens | 原因: {reason}")
-        cmd = (
-            f"onchainos swap execute "
-            f"--from {addr} --to {USDC_ADDR} "
-            f"--readable-amount {amount_tokens:.6f} "
-            f"--chain solana --wallet {WALLET} "
-            f"--gas-level fast --slippage 15"
-        )
-        out = run(cmd, timeout=90)
-        d = jparse(out)
-        tx = d.get("data", {}).get("swapTxHash", "")
-        if tx:
-            log(f"  卖出成功 {sym} | TX: https://solscan.io/tx/{tx}")
-            return True, tx
-        err = out[:150] if out else "无返回"
-        log(f"  卖出失败 [{attempt}/{max_retries}] {sym} | {err}")
-        if attempt < max_retries:
-            time.sleep(5 * attempt)
-    log(f"  卖出彻底失败 {sym}，已重试 {max_retries} 次，需人工处理")
+    wallet = get_wallet_address()
+    if not wallet:
+        return False, ""
+
+    if config.PAPER_TRADE:
+        feed(f"  [PAPER] SELL {symbol} reason={reason}")
+        return True, "paper_sell_" + str(int(time.time()))
+
+    raw_amount = str(int(token_amount))
+    if int(token_amount) <= 0:
+        return False, ""
+
+    for attempt in range(max_retries):
+        try:
+            # Step 1: swap swap (sell token for SOL)
+            data = onchainos_data("swap", "swap",
+                                  "--chain", "solana",
+                                  "--from", token_addr,
+                                  "--to", SOL_NATIVE,
+                                  "--amount", raw_amount,
+                                  "--slippage", str(config.SLIPPAGE_SELL),
+                                  "--wallet", wallet,
+                                  timeout=60)
+            if not data:
+                feed(f"  SELL {symbol} attempt {attempt+1}: swap returned no data")
+                time.sleep(5 * (attempt + 1))
+                continue
+
+            q = data[0] if isinstance(data, list) else data
+
+            # Step 2: Extract tx.to and tx.data
+            tx = q.get("tx", {})
+            tx_to = tx.get("to", "")
+            unsigned_tx = tx.get("data", "")
+
+            if not tx_to or not unsigned_tx:
+                feed(f"  SELL {symbol} attempt {attempt+1}: missing tx.to/tx.data")
+                time.sleep(5 * (attempt + 1))
+                continue
+
+            # Step 3: contract-call
+            result = onchainos_data("wallet", "contract-call",
+                                    "--chain", "501",
+                                    "--to", tx_to,
+                                    "--unsigned-tx", unsigned_tx,
+                                    timeout=60)
+            if not result:
+                feed(f"  SELL {symbol} attempt {attempt+1}: contract-call no data")
+                time.sleep(5 * (attempt + 1))
+                continue
+
+            tx_hash = ""
+            if isinstance(result, dict):
+                tx_hash = result.get("txHash") or result.get("orderId") or ""
+            elif isinstance(result, str):
+                tx_hash = result
+
+            if tx_hash:
+                feed(f"  SELL {symbol} TX: https://solscan.io/tx/{tx_hash}")
+            return True, tx_hash
+
+        except Exception as e:
+            feed(f"  SELL {symbol} attempt {attempt+1} error: {e}")
+            time.sleep(5 * (attempt + 1))
+
     return False, ""
 
 
-def execute_swap(from_addr, to_addr, amount_readable, is_sell=False):
-    """
-    执行 swap：
-      买入：from=USDC_ADDR, to=token
-      卖出：from=token, to=USDC_ADDR
-    返回 (True, tx_hash) 或 (False, '')
-    """
-    cmd = (
-        f"onchainos swap execute "
-        f"--from {from_addr} --to {to_addr} "
-        f"--readable-amount {amount_readable:.6f} "
-        f"--chain solana --wallet {WALLET} "
-        f"--gas-level fast --slippage 15"
-    )
-    out = run(cmd, timeout=90)
-    d = jparse(out)
-    tx = d.get("data", {}).get("swapTxHash", "")
-    if tx:
-        log(f"  swap 成功 | TX: https://solscan.io/tx/{tx}")
-        return True, tx
-    log(f"  swap 失败: {out[:200]}")
-    return False, ""
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5: Tier A - Smart Money Signal Scanner
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-# ─── Tier A：智能钱包跟单信号引擎 ─────────────────────────────────────────────
-#
 def fetch_sm_signals():
-    """
-    使用 onchainos signal list API 获取 SM 信号。
-    返回信号列表：[(addr, signal_strength, n_wallets, mc, sym), ...]
-      signal_strength: 'STRONG' (triggerWalletCount >= 3) 或 'NORMAL' (== 2)
-    """
-    cmd = (
-        "onchainos signal list "
-        "--chain solana --wallet-type 1,2,3 --min-address-count 2"
-    )
-    out = run(cmd, timeout=30)
-    d = jparse(out)
-    items = d.get("data", [])
-    if isinstance(items, dict):
-        items = items.get("list", [])
+    """Fetch smart money signals. Returns list of signal dicts."""
+    try:
+        labels = ",".join(str(l) for l in config.SM_LABELS)
+        data = onchainos_data("signal", "list",
+                              "--chain", "solana",
+                              "--wallet-type", labels,
+                              "--min-address-count", str(config.SM_MIN_WALLETS))
+        if isinstance(data, list):
+            return data
+        elif isinstance(data, dict):
+            return [data]
+    except Exception:
+        pass
+    return []
 
-    signals = []
-    for item in (items or []):
-        addr      = item.get("tokenContractAddress", item.get("tokenAddress", ""))
-        sym       = item.get("tokenSymbol", item.get("symbol", "?"))
-        mc        = sf(item.get("marketCap", item.get("market", {}).get("marketCapUsd", 0)))
-        n_wallets = int(sf(item.get("triggerWalletCount", item.get("addressCount", 0))))
-        sold_ratio = sf(item.get("soldRatioPercent", 100))
 
-        if not addr:
+def process_tier_a():
+    """Process Tier A smart money signals. Returns after 1 successful buy."""
+    signals = fetch_sm_signals()
+    if not signals:
+        return
+
+    feed(f"Tier A SM signals: {len(signals)}")
+    night = is_night()
+    size = config.TIER_A_SIZE_NIGHT if night else config.TIER_A_SIZE_DAY
+
+    # Get hot tokens for NORMAL signal confirmation
+    hot = get_hot_tokens()
+
+    for sig in signals:
+        token = sig.get("token", {})
+        if not isinstance(token, dict):
             continue
-        # Filter: MC $20k-$2M, soldRatio < 40%, at least 2 wallets
-        if not (20000 <= mc <= 2000000):
+        addr = token.get("tokenAddress", "") or token.get("address", "")
+        symbol = token.get("symbol", "?")
+        wallet_count = safe_int(sig.get("triggerWalletCount", 0))
+        sold_ratio = safe_float(sig.get("soldRatioPercent", 100))
+        mc = safe_float(token.get("marketCap", 0))
+
+        if not addr or addr in _NEVER_TRADE:
             continue
-        if sold_ratio >= 40:
+        if addr in acted or addr in cooldown_map and time.time() < cooldown_map.get(addr, 0):
             continue
-        if n_wallets < 2:
+        with pos_lock:
+            if addr in state["positions"]:
+                continue
+
+        # Pre-filter from signal data
+        if sold_ratio > 80:
+            continue
+        if mc < config.TIER_A_MC_MIN or mc > config.TIER_A_MC_MAX:
             continue
 
-        strength = "STRONG" if n_wallets >= 3 else "NORMAL"
-        signals.append((addr, strength, n_wallets, mc, sym))
+        # Signal strength classification
+        is_strong = wallet_count >= config.SM_STRONG_THRESH
 
-    return signals
+        # NORMAL signals need hot-tokens confirmation
+        if not is_strong:
+            hot_entry = hot.get(addr, {})
+            inflow = safe_float(hot_entry.get("inflow", 0))
+            if inflow <= 0:
+                continue
+
+        # Deep verification
+        try:
+            price_info = get_token_price(addr)
+            liq = safe_float(price_info.get("liquidity", 0))
+            holders = safe_int(price_info.get("holders", 0))
+            price = safe_float(price_info.get("price", 0))
+
+            if liq < config.TIER_A_LIQ_MIN:
+                continue
+            if holders < config.TIER_A_HOLDERS_MIN:
+                continue
+
+            # K1 pump guard
+            if _k1_pump_guard(addr, config.TIER_A_K1_PUMP_GUARD):
+                feed(f"  Skip {symbol}: K1 pump guard")
+                continue
+
+            # Risk check
+            rc = pre_trade_checks(addr, symbol, quick=True)
+            if not rc.get("pass", False):
+                feed(f"  Skip {symbol}: risk G{rc.get('grade', '?')}")
+                continue
+
+        except Exception as e:
+            feed(f"  Skip {symbol}: verification error: {e}")
+            continue
+
+        # Entry check
+        ok, reason = can_enter()
+        if not ok:
+            feed(f"  Skip {symbol}: {reason}")
+            return
+
+        # Execute buy
+        feed(f"ENTER TIER_A {symbol} ${size} | MC=${mc:,.0f} | wallets={wallet_count}")
+        success, tx_hash, token_amt = execute_buy(addr, size)
+
+        if success and token_amt > 0:
+            _create_position(addr, symbol, "A", size, price, mc, liq,
+                             token_amt, tx_hash, rc if 'rc' in dir() else None)
+            acted[addr] = int(time.time())
+            save_acted()
+            if tx_hash and not tx_hash.startswith("paper"):
+                feed(f"  swap OK | TX: https://solscan.io/tx/{tx_hash}")
+            return
+        elif tx_hash == "TIMEOUT":
+            _create_unconfirmed_position(addr, symbol, "A", size, price, mc)
+            acted[addr] = int(time.time())
+            save_acted()
+            feed(f"  BUY TIMEOUT {symbol}: created unconfirmed position")
+            return
+        else:
+            feed(f"  BUY FAIL {symbol}")
+            cooldown_map[addr] = time.time() + 300
 
 
-# ─── Hot-tokens 缓存 ─────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 6: Tier B - Graduation Ambush Scanner
+# ══════════════════════════════════════════════════════════════════════════════
 
-_hot_tokens_cache = {}
-_hot_tokens_ts = 0
+def fetch_graduated_tokens():
+    """Fetch recently graduated tokens. Returns list of token dicts."""
+    try:
+        data = onchainos_data("memepump", "tokens",
+                              "--chain", "solana",
+                              "--stage", config.TIER_B_STAGE)
+        if isinstance(data, list):
+            return data
+        elif isinstance(data, dict):
+            return [data]
+    except Exception:
+        pass
+    return []
+
+
+def process_tier_b():
+    """Process Tier B graduated tokens. Returns after 1 successful buy."""
+    candidates = fetch_graduated_tokens()
+    if not candidates:
+        return
+
+    night = is_night()
+    size = config.TIER_B_SIZE_NIGHT if night else config.TIER_B_SIZE_DAY
+    filtered = []
+
+    for tok in candidates:
+        if not isinstance(tok, dict):
+            continue
+        addr = tok.get("tokenAddress", "") or tok.get("address", "") or tok.get("mint", "")
+        if not addr or addr in _NEVER_TRADE:
+            continue
+
+        mc = safe_float(tok.get("marketCap", 0) or tok.get("usdMarketCap", 0))
+        holders = safe_int(tok.get("holders", 0) or tok.get("holderCount", 0))
+        dev_sold = tok.get("devSold", False) or tok.get("creatorClose", False)
+        insiders_pct = safe_float(tok.get("insiderPercent", 0) or tok.get("insiderHoldingPercent", 0))
+        top10 = safe_float(tok.get("top10HoldPercent", 0) or tok.get("top10Percent", 0))
+        aped = safe_int(tok.get("apedCount", 0) or tok.get("smartMoneyCount", 0))
+
+        if mc < config.TIER_B_MC_MIN or mc > config.TIER_B_MC_MAX:
+            continue
+        if holders < config.TIER_B_HOLDERS_MIN:
+            continue
+        if config.TIER_B_DEV_SOLD and not dev_sold:
+            continue
+        if insiders_pct > config.TIER_B_INSIDERS_MAX:
+            continue
+        if top10 > config.TIER_B_TOP10_MAX:
+            continue
+        if aped < config.TIER_B_APED_MIN:
+            continue
+
+        filtered.append({"addr": addr, "mc": mc, "holders": holders,
+                         "symbol": tok.get("symbol", tok.get("tokenSymbol", "?"))})
+
+    feed(f"Tier B MIGRATED candidates: {len(filtered)}")
+
+    for cand in filtered:
+        addr = cand["addr"]
+        symbol = cand["symbol"]
+        mc = cand["mc"]
+
+        if addr in acted or addr in cooldown_map and time.time() < cooldown_map.get(addr, 0):
+            continue
+        with pos_lock:
+            if addr in state["positions"]:
+                continue
+
+        # K1 pump guard
+        if _k1_pump_guard(addr, config.TIER_A_K1_PUMP_GUARD):
+            continue
+
+        # Quick risk check
+        try:
+            rc = pre_trade_checks(addr, symbol, quick=True)
+            if not rc.get("pass", False):
+                continue
+        except Exception:
+            continue
+
+        # Get price info
+        price_info = get_token_price(addr)
+        price = safe_float(price_info.get("price", 0))
+        liq = safe_float(price_info.get("liquidity", 0))
+
+        # Entry check
+        ok, reason = can_enter()
+        if not ok:
+            return
+
+        feed(f"ENTER TIER_B {symbol} ${size} | MC=${mc:,.0f}")
+        success, tx_hash, token_amt = execute_buy(addr, size)
+
+        if success and token_amt > 0:
+            _create_position(addr, symbol, "B", size, price, mc, liq,
+                             token_amt, tx_hash, rc)
+            acted[addr] = int(time.time())
+            save_acted()
+            if tx_hash and not tx_hash.startswith("paper"):
+                feed(f"  swap OK | TX: https://solscan.io/tx/{tx_hash}")
+            return
+        elif tx_hash == "TIMEOUT":
+            _create_unconfirmed_position(addr, symbol, "B", size, price, mc)
+            acted[addr] = int(time.time())
+            save_acted()
+            feed(f"  BUY TIMEOUT {symbol}: unconfirmed position")
+            return
+        else:
+            feed(f"  BUY FAIL {symbol}")
+            cooldown_map[addr] = time.time() + 300
+            return
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 7: Tier D - Hot Momentum Scanner
+# ══════════════════════════════════════════════════════════════════════════════
+
+def fetch_hot_momentum():
+    """Fetch hot momentum tokens. Returns list of token dicts."""
+    try:
+        data = onchainos_data("token", "hot-tokens",
+                              "--chain", "solana",
+                              "--ranking-type", "4",
+                              "--limit", "20")
+        if isinstance(data, list):
+            return data
+        elif isinstance(data, dict):
+            return [data]
+    except Exception:
+        pass
+    return []
+
+
+def calculate_score(tok):
+    """Calculate composite score 0-100 for a hot momentum token."""
+    score = 0
+
+    # Holders weight (0-30)
+    holders = safe_int(tok.get("holders", 0) or tok.get("holderCount", 0))
+    if holders >= 5000:
+        score += 30
+    elif holders >= 2000:
+        score += 25
+    elif holders >= 1000:
+        score += 20
+    elif holders >= 500:
+        score += 15
+
+    # Buy/sell ratio weight (0-25)
+    buys = safe_int(tok.get("buys", 0) or tok.get("buyCount", 0))
+    sells = safe_int(tok.get("sells", 0) or tok.get("sellCount", 0))
+    if sells > 0:
+        ratio = buys / sells
+        if ratio >= 2.0:
+            score += 25
+        elif ratio >= 1.5:
+            score += 20
+        elif ratio >= 1.2:
+            score += 15
+        elif ratio >= 1.0:
+            score += 10
+
+    # Unique traders weight (0-15)
+    traders = safe_int(tok.get("uniqueTraders", 0) or tok.get("traderCount", 0))
+    if traders >= 500:
+        score += 15
+    elif traders >= 300:
+        score += 12
+    elif traders >= 200:
+        score += 9
+    elif traders >= 100:
+        score += 6
+
+    # Price change weight (0-15)
+    change = safe_float(tok.get("change", 0) or tok.get("priceChange", 0) or tok.get("changePct", 0))
+    if change >= 30:
+        score += 15
+    elif change >= 20:
+        score += 12
+    elif change >= 10:
+        score += 9
+    elif change >= 5:
+        score += 6
+
+    # Inflow weight (0-15)
+    inflow = safe_float(tok.get("inflowUsd", 0) or tok.get("netInflowUsd", 0) or tok.get("inflow", 0))
+    if inflow >= 50000:
+        score += 15
+    elif inflow >= 20000:
+        score += 12
+    elif inflow >= 5000:
+        score += 9
+    elif inflow > 0:
+        score += 5
+
+    return score
+
+
+def score_to_size(score):
+    """Convert score to position size in USD."""
+    night = is_night()
+    base = 3 if night else config.TIER_D_SIZE_BASE
+    for tier in config.TIER_D_SCORE_TIERS:
+        if score >= tier["min_score"]:
+            return base + tier["extra"]
+    return base
+
+
+def process_tier_d():
+    """Process Tier D hot momentum tokens. Returns after 1 successful buy."""
+    candidates = fetch_hot_momentum()
+    if not candidates:
+        return
+
+    filtered = []
+    for tok in candidates:
+        if not isinstance(tok, dict):
+            continue
+        addr = tok.get("tokenAddress", "") or tok.get("address", "")
+        if not addr or addr in _NEVER_TRADE:
+            continue
+
+        holders = safe_int(tok.get("holders", 0) or tok.get("holderCount", 0))
+        mc = safe_float(tok.get("marketCap", 0) or tok.get("usdMarketCap", 0))
+        liq = safe_float(tok.get("liquidity", 0) or tok.get("liquidityUsd", 0))
+        top10 = safe_float(tok.get("top10HoldPercent", 0) or tok.get("top10Percent", 0))
+        risk_level = safe_int(tok.get("riskLevel", 99) or tok.get("riskControlLevel", 99))
+        inflow = safe_float(tok.get("inflowUsd", 0) or tok.get("netInflowUsd", 0) or tok.get("inflow", 0))
+        change = safe_float(tok.get("change", 0) or tok.get("priceChange", 0) or tok.get("changePct", 0))
+        traders = safe_int(tok.get("uniqueTraders", 0) or tok.get("traderCount", 0))
+
+        if holders < config.TIER_D_HOLDERS_MIN:
+            continue
+        if mc < config.TIER_D_MC_MIN or mc > config.TIER_D_MC_MAX:
+            continue
+        if liq < config.TIER_D_LIQ_MIN:
+            continue
+        if top10 > config.TIER_D_TOP10_MAX:
+            continue
+        if risk_level > config.TIER_D_RISK_LEVEL:
+            continue
+        if inflow <= config.TIER_D_MIN_INFLOW:
+            continue
+        if change < config.TIER_D_MIN_CHANGE:
+            continue
+        if traders < config.TIER_D_UNIQUE_TRADERS:
+            continue
+
+        filtered.append(tok)
+
+    feed(f"Tier D hot candidates: {len(filtered)}")
+
+    for tok in filtered:
+        addr = tok.get("tokenAddress", "") or tok.get("address", "")
+        symbol = tok.get("symbol", tok.get("tokenSymbol", "?"))
+        mc = safe_float(tok.get("marketCap", 0) or tok.get("usdMarketCap", 0))
+
+        if addr in acted or addr in cooldown_map and time.time() < cooldown_map.get(addr, 0):
+            continue
+        with pos_lock:
+            if addr in state["positions"]:
+                continue
+
+        # Calculate score
+        score = calculate_score(tok)
+        if score < config.TIER_D_SCORE_THRESHOLD:
+            continue
+
+        # K1 pump guard
+        if _k1_pump_guard(addr, config.TIER_A_K1_PUMP_GUARD):
+            feed(f"  Skip {symbol}: K1 pump guard (score={score})")
+            continue
+
+        # Quick risk check
+        try:
+            rc = pre_trade_checks(addr, symbol, quick=True)
+            if not rc.get("pass", False):
+                feed(f"  Skip {symbol}: risk G{rc.get('grade', '?')}")
+                continue
+        except Exception:
+            continue
+
+        # Get price info
+        price_info = get_token_price(addr)
+        price = safe_float(price_info.get("price", 0))
+        liq = safe_float(price_info.get("liquidity", 0))
+
+        # Entry check
+        ok, reason = can_enter()
+        if not ok:
+            return
+
+        size = score_to_size(score)
+        feed(f"ENTER TIER_D {symbol} ${size} | MC=${mc:,.0f} | score={score}")
+        success, tx_hash, token_amt = execute_buy(addr, size)
+
+        if success and token_amt > 0:
+            _create_position(addr, symbol, "D", size, price, mc, liq,
+                             token_amt, tx_hash, rc)
+            acted[addr] = int(time.time())
+            save_acted()
+            if tx_hash and not tx_hash.startswith("paper"):
+                feed(f"  swap OK | TX: https://solscan.io/tx/{tx_hash}")
+            return
+        elif tx_hash == "TIMEOUT":
+            _create_unconfirmed_position(addr, symbol, "D", size, price, mc)
+            acted[addr] = int(time.time())
+            save_acted()
+            feed(f"  BUY TIMEOUT {symbol}: unconfirmed position")
+            return
+        else:
+            feed(f"  BUY FAIL {symbol}")
+            cooldown_map[addr] = time.time() + 300
+            return
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 8: Position Monitor - 7-Layer Exit System
+# ══════════════════════════════════════════════════════════════════════════════
+
+def monitor_positions():
+    """Position monitor loop. Runs every MONITOR_SEC (1s)."""
+    while True:
+        time.sleep(config.MONITOR_SEC)
+        try:
+            _monitor_cycle()
+        except Exception as e:
+            feed(f"MONITOR ERROR: {e}")
+
+
+def _monitor_cycle():
+    """Single monitoring cycle for all positions."""
+    with pos_lock:
+        positions = dict(state["positions"])
+    if not positions:
+        return
+
+    now = time.time()
+
+    # Handle unconfirmed positions first
+    for addr, pos in list(positions.items()):
+        if not pos.get("unconfirmed"):
+            continue
+        elapsed = now - pos.get("unconfirmed_ts", pos.get("opened_at_ts", 0))
+        if elapsed < 60:
+            continue
+        checks = pos.get("unconfirmed_checks", 0)
+        try:
+            pi = get_token_price(addr)
+            price = safe_float(pi.get("price", 0))
+            if price > 0:
+                with pos_lock:
+                    if addr in state["positions"]:
+                        state["positions"][addr].pop("unconfirmed", None)
+                        state["positions"][addr].pop("unconfirmed_ts", None)
+                        state["positions"][addr].pop("unconfirmed_checks", None)
+                        state["positions"][addr]["entry_price"] = price
+                        state["positions"][addr]["peak_price"] = price
+                        # Try to get token balance
+                        wallet = get_wallet_address()
+                        bal = get_token_balance(wallet, addr)
+                        if bal > 0:
+                            state["positions"][addr]["token_amount"] = bal
+                        save_positions()
+                feed(f"  CONFIRMED {pos.get('symbol', addr[:8])}: unconfirmed -> active")
+                continue
+        except Exception:
+            pass
+        checks += 1
+        with pos_lock:
+            if addr in state["positions"]:
+                state["positions"][addr]["unconfirmed_checks"] = checks
+        if checks >= 10 and elapsed >= 180:
+            with pos_lock:
+                state["positions"].pop(addr, None)
+                save_positions()
+            feed(f"  DROPPED {pos.get('symbol', addr[:8])}: unconfirmed x{checks}")
+        continue
+
+    # Fetch prices for all active positions
+    price_map = {}
+    for addr, pos in positions.items():
+        if pos.get("unconfirmed"):
+            continue
+        pi = get_token_price(addr)
+        if pi:
+            price_map[addr] = pi
+
+    # Process each position
+    for addr, pos in positions.items():
+        if pos.get("unconfirmed"):
+            continue
+        if addr in _selling:
+            continue
+
+        pi = price_map.get(addr, {})
+        cur_price = safe_float(pi.get("price", 0))
+        cur_liq = safe_float(pi.get("liquidity", 0))
+
+        entry_price = safe_float(pos.get("entry_price", 0))
+        if entry_price <= 0:
+            continue
+
+        # 3-check protection: if price is 0, increment zero count
+        if cur_price <= 0:
+            with pos_lock:
+                if addr in state["positions"]:
+                    zc = state["positions"][addr].get("zero_count", 0) + 1
+                    state["positions"][addr]["zero_count"] = zc
+                    if zc >= 3:
+                        # Still do not delete - just skip monitoring
+                        pass
+            continue
+        else:
+            # Reset zero count on valid price
+            with pos_lock:
+                if addr in state["positions"]:
+                    state["positions"][addr]["zero_count"] = 0
+
+        pnl_pct = (cur_price - entry_price) / entry_price
+        age_sec = now - safe_float(pos.get("opened_at_ts", now))
+        age_min = age_sec / 60.0
+        tier = pos.get("tier", "D")
+        token_amount = safe_float(pos.get("token_amount", 0))
+        symbol = pos.get("symbol", addr[:8])
+        peak_price = safe_float(pos.get("peak_price", entry_price))
+
+        # Update peak price
+        if cur_price > peak_price:
+            peak_price = cur_price
+            with pos_lock:
+                if addr in state["positions"]:
+                    state["positions"][addr]["peak_price"] = cur_price
+
+        # Update live data
+        with pos_lock:
+            if addr in state["positions"]:
+                state["positions"][addr]["current_price"] = cur_price
+                state["positions"][addr]["pnl_pct"] = pnl_pct
+                state["positions"][addr]["age_min"] = age_min
+
+        # ── Layer 1: HE1 Emergency ──
+        if pnl_pct <= config.HE1_PCT:
+            _exit_position(addr, pos, 1.0, "HE1_EMERGENCY", pnl_pct)
+            continue
+
+        # ── Layer 2: FAST_DUMP ──
+        if pnl_pct < 0:
+            drop_from_peak = (peak_price - cur_price) / peak_price if peak_price > 0 else 0
+            if drop_from_peak >= abs(config.FAST_DUMP_PCT):
+                # Check if drop happened recently (within FAST_DUMP_SEC)
+                last_peak_ts = safe_float(pos.get("last_peak_ts", 0))
+                if last_peak_ts > 0 and (now - last_peak_ts) <= config.FAST_DUMP_SEC:
+                    _exit_position(addr, pos, 1.0, "FAST_DUMP", pnl_pct)
+                    continue
+
+        # Track peak timestamp for FAST_DUMP detection
+        if cur_price >= peak_price:
+            with pos_lock:
+                if addr in state["positions"]:
+                    state["positions"][addr]["last_peak_ts"] = now
+
+        # ── Layer 3: LIQ_EMERGENCY ──
+        liq_check_interval = 300  # 5 min
+        last_liq_check = safe_float(pos.get("last_liq_check", 0))
+        if cur_liq > 0 and (now - last_liq_check) >= liq_check_interval:
+            with pos_lock:
+                if addr in state["positions"]:
+                    state["positions"][addr]["last_liq_check"] = now
+            if cur_liq < config.LIQ_EMERGENCY:
+                _exit_position(addr, pos, 1.0, "LIQ_EMERGENCY", pnl_pct)
+                continue
+
+        # ── Layer 4: Hard Stop Loss ──
+        sl_rules = config.SL_RULES.get(tier, config.SL_RULES.get("D", {}))
+        hard_sl = safe_float(sl_rules.get("sl_pct", -0.15))
+        if pnl_pct <= hard_sl:
+            _exit_position(addr, pos, 1.0, f"HARD_SL({hard_sl:.0%})", pnl_pct)
+            continue
+
+        # ── Layer 5: Time-decay SL ──
+        time_decay = sl_rules.get("time_decay", [])
+        td_exit = False
+        for rule in sorted(time_decay, key=lambda r: r[0], reverse=True):
+            after_min, tighten_to = rule[0], rule[1]
+            if age_min >= after_min:
+                if pnl_pct <= tighten_to:
+                    _exit_position(addr, pos, 1.0,
+                                   f"TIME_DECAY_SL({after_min}m/{tighten_to:.0%})", pnl_pct)
+                    td_exit = True
+                break
+        if td_exit:
+            continue
+
+        # ── Layer 6: Timeout ──
+        timeout_hrs = safe_float(sl_rules.get("timeout_hrs", 48))
+        if age_min >= timeout_hrs * 60:
+            _exit_position(addr, pos, 1.0, "TIMEOUT", pnl_pct)
+            continue
+
+        # ── Layer 7: Trailing Stop (after TP1) ──
+        tp_tier_done = safe_int(pos.get("tp_tier", 0))
+        tp_rules = config.TP_RULES.get(tier, config.TP_RULES.get("D", {}))
+        trailing_pct = safe_float(tp_rules.get("trailing_pct", 0.10))
+
+        if tp_tier_done >= 1 and peak_price > entry_price:
+            drop_from_peak = (peak_price - cur_price) / peak_price
+            if drop_from_peak >= trailing_pct:
+                _exit_position(addr, pos, 1.0, f"TRAILING({trailing_pct:.0%})", pnl_pct)
+                continue
+
+        # ── Tiered Take Profit ──
+        if tp_tier_done == 0:
+            tp1_pct = safe_float(tp_rules.get("tp1_pct", 0.15))
+            tp1_sell = safe_float(tp_rules.get("tp1_sell", 0.60))
+            if pnl_pct >= tp1_pct:
+                _exit_position(addr, pos, tp1_sell, f"TP1(+{tp1_pct:.0%})", pnl_pct)
+                with pos_lock:
+                    if addr in state["positions"]:
+                        state["positions"][addr]["tp_tier"] = 1
+                continue
+
+        if tp_tier_done == 1:
+            tp2_pct = safe_float(tp_rules.get("tp2_pct", 0.30))
+            tp2_sell = safe_float(tp_rules.get("tp2_sell", 0.50))
+            if pnl_pct >= tp2_pct:
+                _exit_position(addr, pos, tp2_sell, f"TP2(+{tp2_pct:.0%})", pnl_pct)
+                with pos_lock:
+                    if addr in state["positions"]:
+                        state["positions"][addr]["tp_tier"] = 2
+                continue
+
+    # Post-trade flags (background, throttled)
+    for addr, pos in positions.items():
+        if pos.get("unconfirmed"):
+            continue
+        last_rc = safe_float(pos.get("risk_last_checked", 0))
+        if now - last_rc < 60:
+            continue
+        with pos_lock:
+            if addr in state["positions"]:
+                state["positions"][addr]["risk_last_checked"] = now
+        _sym = pos.get("symbol", "?")
+        _eliq = safe_float(pos.get("entry_liq", 0))
+        _et10 = safe_float(pos.get("entry_top10", 0))
+        _esp = safe_float(pos.get("entry_sniper_pct", 0))
+
+        def _run_post_flags(_a=addr, _s=_sym, _l=_eliq, _t=_et10, _sp=_esp):
+            try:
+                flags = post_trade_flags(_a, _s, entry_liquidity_usd=_l,
+                                         entry_top10=_t, entry_sniper_pct=_sp)
+                for flag in flags:
+                    feed(f"  RISK {_s}: {flag}")
+                    if flag.startswith("EXIT_NOW"):
+                        _exit_position(_a, None, 1.0, f"RISK_EXIT", 0)
+                        break
+            except Exception:
+                pass
+
+        threading.Thread(target=_run_post_flags, daemon=True).start()
+
+    # Save positions after monitor cycle
+    with pos_lock:
+        save_positions()
+
+
+def _exit_position(addr, pos, sell_ratio, reason, pnl_pct):
+    """Execute position exit (full or partial sell)."""
+    with pos_lock:
+        if addr not in state["positions"]:
+            return
+        if addr in _selling:
+            return
+        _selling.add(addr)
+        pos = dict(state["positions"][addr])
+
+    try:
+        symbol = pos.get("symbol", addr[:8])
+        token_amount = safe_float(pos.get("token_amount", 0))
+        size_usd = safe_float(pos.get("size_usd", 0))
+        sell_amount = token_amount * sell_ratio
+
+        if sell_amount <= 0 or int(sell_amount) <= 0:
+            return
+
+        success, tx_hash = execute_sell(addr, symbol, sell_amount, reason)
+
+        if not success:
+            feed(f"  SELL FAIL {symbol} [{reason}]")
+            with pos_lock:
+                if addr in state["positions"]:
+                    fc = state["positions"][addr].get("sell_fail_count", 0) + 1
+                    state["positions"][addr]["sell_fail_count"] = fc
+            return
+
+        # Record trade
+        pnl_usd = size_usd * sell_ratio * pnl_pct
+        _record_trade(addr, pos, reason, pnl_pct, sell_ratio, tx_hash, pnl_usd)
+
+        # Update or remove position
+        with pos_lock:
+            if sell_ratio >= 0.99:
+                state["positions"].pop(addr, None)
+                cooldown_map[addr] = time.time() + 1800  # 30min cooldown
+            else:
+                if addr in state["positions"]:
+                    state["positions"][addr]["token_amount"] = token_amount - sell_amount
+                    state["positions"][addr]["size_usd"] = size_usd * (1 - sell_ratio)
+                    state["positions"][addr]["sell_fail_count"] = 0
+            save_positions()
+
+        pnl_display = f"{pnl_pct*100:+.1f}%"
+        multiplier = 1 + pnl_pct
+        feed(f"SELL {symbol} [{reason}] {sell_ratio:.0%} PnL={pnl_display} ({multiplier:.2f}x)")
+
+        with state_lock:
+            state["stats"]["sells"] += 1
+            state["stats"]["net_pnl"] = round(state["stats"]["net_pnl"] + pnl_usd, 2)
+
+    finally:
+        with pos_lock:
+            _selling.discard(addr)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 9: Session Risk Control
+# ══════════════════════════════════════════════════════════════════════════════
+
+def can_enter():
+    """Check if opening new positions is allowed. Returns (ok, reason)."""
+    if config.PAUSED:
+        return False, "PAUSED"
+
+    # Startup cooldown
+    if time.time() - _startup_ts < config.STARTUP_COOLDOWN:
+        remain = int(config.STARTUP_COOLDOWN - (time.time() - _startup_ts))
+        return False, f"STARTUP_COOLDOWN ({remain}s)"
+
+    with state_lock:
+        if session_risk["stopped"]:
+            return False, "SESSION_STOPPED (daily loss limit)"
+        if time.time() < session_risk["paused_until"]:
+            remain = int(session_risk["paused_until"] - time.time())
+            return False, f"SESSION_PAUSED ({remain}s)"
+
+    with pos_lock:
+        if len(state["positions"]) >= config.MAX_POSITIONS:
+            return False, "MAX_POSITIONS"
+
+    return True, "OK"
+
+
+def record_loss(pnl_usd):
+    """Record loss and update session risk control."""
+    with state_lock:
+        session_risk["consecutive_losses"] += 1
+        session_risk["cumulative_loss_usd"] += abs(pnl_usd)
+
+        if session_risk["cumulative_loss_usd"] >= config.DAILY_LOSS_LIMIT:
+            session_risk["stopped"] = True
+            feed(f"SESSION_STOP: daily loss ${session_risk['cumulative_loss_usd']:.2f} >= ${config.DAILY_LOSS_LIMIT}")
+        elif session_risk["consecutive_losses"] >= config.MAX_CONSEC_LOSS:
+            session_risk["paused_until"] = time.time() + config.PAUSE_CONSEC_SEC
+            feed(f"SESSION_PAUSE: {session_risk['consecutive_losses']} consecutive losses, "
+                 f"paused {config.PAUSE_CONSEC_SEC // 60}min")
+
+    save_session()
+
+
+def record_win():
+    """Record win and reset consecutive losses."""
+    with state_lock:
+        session_risk["consecutive_losses"] = 0
+    save_session()
+
+
+def _record_trade(addr, pos, reason, pnl_pct, sell_ratio, tx_hash, pnl_usd):
+    """Record trade in history and update session risk."""
+    rand_suffix = ''.join(random.choices(string.ascii_lowercase, k=4))
+    trade = {
+        "tradeId": f"sell-{int(time.time())}-{addr[:4]}-{rand_suffix}",
+        "timestamp": int(time.time()),
+        "direction": "sell",
+        "tokenAddress": addr,
+        "symbol": pos.get("symbol", addr[:8]),
+        "tier": pos.get("tier", "?"),
+        "size_usd": safe_float(pos.get("size_usd", 0)) * sell_ratio,
+        "pnl_pct": pnl_pct,
+        "pnl_usd": round(pnl_usd, 4),
+        "reason": reason,
+        "sell_ratio": sell_ratio,
+        "txHash": tx_hash or "",
+        "mode": "paper" if config.PAPER_TRADE else "live",
+        "t": datetime.now().strftime("%H:%M:%S"),
+    }
+
+    with state_lock:
+        state["trades"].insert(0, trade)
+        state["trades"] = state["trades"][:200]
+        with trades_lock:
+            save_trades()
+
+    # Session risk update
+    if pnl_pct < 0:
+        record_loss(pnl_usd)
+    else:
+        record_win()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 10: Hot Tokens Cache
+# ══════════════════════════════════════════════════════════════════════════════
+
+_hot_cache = {}
+_hot_cache_ts = 0
 
 
 def get_hot_tokens():
-    """
-    获取 hot-tokens 列表，缓存 HOT_REFRESH 秒。
-    返回 {addr: {inflow, sym, mc}}
-    """
-    global _hot_tokens_cache, _hot_tokens_ts
+    """Get hot tokens cache. Refreshes every HOT_REFRESH_SEC."""
+    global _hot_cache, _hot_cache_ts
     now = time.time()
-    if now - _hot_tokens_ts < HOT_REFRESH and _hot_tokens_cache:
-        return _hot_tokens_cache
+    if now - _hot_cache_ts < config.HOT_REFRESH_SEC and _hot_cache:
+        return _hot_cache
 
-    out = run("onchainos token hot-tokens --chain solana --ranking-type 4 --limit 50", timeout=25)
-    d = jparse(out)
-    items = d.get("data", [])
-    if isinstance(items, dict):
-        items = items.get("list", [])
-
-    result = {}
-    for t in (items or []):
-        addr = t.get("tokenContractAddress", "")
-        if addr:
-            result[addr] = {
-                "inflow": sf(t.get("inflowUsd", 0)),
-                "sym":    t.get("tokenSymbol", "?"),
-                "mc":     sf(t.get("marketCap", 0)),
-            }
-
-    _hot_tokens_cache = result
-    _hot_tokens_ts = now
-    log(f"  hot-tokens 刷新: {len(result)} 个")
-    return result
-
-
-def get_hot_inflow(hot_cache, addr):
-    """从缓存中返回 inflow，未命中返回 0"""
-    return hot_cache.get(addr, {}).get("inflow", 0)
-
-
-def fetch_hot_momentum_tokens():
-    """
-    Fetch hot tokens with momentum filters for Tier D.
-    Uses onchainos token hot-tokens API with ranking-type 4.
-    """
-    out = run("onchainos token hot-tokens --chain solana --ranking-type 4 --limit 20", timeout=25)
-    d = jparse(out)
-    items = d.get("data", [])
-    if isinstance(items, dict):
-        items = items.get("list", [])
-
-    candidates = []
-    for t in (items or []):
-        addr = t.get("tokenContractAddress", "")
-        if not addr:
-            continue
-        holders = int(sf(t.get("holders", 0)))
-        mc = sf(t.get("marketCap", 0))
-        liq = sf(t.get("liquidity", 0))
-        top10 = sf(t.get("top10HoldPercent", 100))
-        risk = t.get("riskLevelControl", "")
-        inflow = sf(t.get("inflowUsd", 0))
-        change = sf(t.get("change", 0))
-        unique_traders = int(sf(t.get("uniqueTraders", 0)))
-        buy_tx = int(sf(t.get("txsBuy", 0)))
-        sell_tx = int(sf(t.get("txsSell", 0)))
-
-        # Filter conditions
-        if holders < TIER_D_MIN_HOLDERS:
-            continue
-        if not (TIER_D_MIN_MC <= mc <= TIER_D_MAX_MC):
-            continue
-        if liq < TIER_D_MIN_LIQ:
-            continue
-        if top10 >= TIER_D_MAX_TOP10:
-            continue
-        if risk != "1":
-            continue
-        if inflow <= 0:
-            continue
-        if change <= 5:
-            continue
-        if unique_traders < TIER_D_MIN_TRADERS:
-            continue
-        if buy_tx <= sell_tx:
-            continue
-
-        t["_filtered"] = True
-        candidates.append(t)
-
-    return candidates
-
-
-# ─── v5.1：K1 pump guard + TOP_ZONE filter ───────────────────────────────────
-
-def check_k1_pump(addr, sym="?"):
-    """
-    查询最近 1 分钟 K 线，若涨幅 > +15% 则返回 True（防追高）。
-    API 失败时 fail-open 返回 False。
-    """
     try:
-        out = run(f"onchainos market kline --chain solana --address {addr} --bar 1m", timeout=15)
-        d = jparse(out)
-        candles = d.get("data", [])
-        if not candles:
-            return False
-        last = candles[-1]
-        close = sf(last.get("close", 0))
-        open_ = sf(last.get("open", close))
-        if open_ <= 0:
-            return False
-        pct = (close - open_) / open_
-        if pct > 0.15:
-            log(f"  K1_PUMP_GUARD: skip {sym} 1m={pct:.1%}")
-            return True
-        return False
-    except Exception as e:
-        log(f"  WARN check_k1_pump: {e} (fail-open)")
-        return False
+        data = onchainos_data("token", "hot-tokens",
+                              "--chain", "solana",
+                              "--ranking-type", "4",
+                              "--limit", "50")
+        if isinstance(data, list):
+            cache = {}
+            for tok in data:
+                addr = tok.get("tokenAddress", "") or tok.get("address", "")
+                if addr:
+                    cache[addr] = {
+                        "inflow": safe_float(tok.get("inflowUsd", 0) or tok.get("netInflowUsd", 0)),
+                        "sym": tok.get("symbol", "?"),
+                        "mc": safe_float(tok.get("marketCap", 0)),
+                    }
+            _hot_cache = cache
+            _hot_cache_ts = now
+            feed(f"  hot-tokens refresh: {len(cache)} tokens")
+    except Exception:
+        pass
+
+    return _hot_cache
 
 
-def check_top_zone(addr, cur_price, sym="?"):
-    """
-    取最近 12 根 5m K 线（= 1h），若当前价 > 85% of 1h high → True（处于顶部区）。
-    API 失败时 fail-open 返回 False。
-    """
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 11: Position Takeover & Helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def takeover_existing_positions():
+    """Scan wallet balance at startup. Inject existing tokens as 'takeover' tier."""
+    feed("=== Position Takeover: scanning wallet ===")
+    wallet = get_wallet_address()
+    if not wallet:
+        feed("  Takeover: no wallet address")
+        return
+
     try:
-        out = run(f"onchainos market kline --chain solana --address {addr} --bar 5m", timeout=15)
-        d = jparse(out)
-        candles = d.get("data", [])
-        if not candles:
-            return False
-        recent = candles[-12:] if len(candles) >= 12 else candles
-        h1_high = max(sf(c.get("high", 0)) for c in recent)
-        if h1_high <= 0:
-            return False
-        pct = cur_price / h1_high
-        if pct > 0.85:
-            log(f"  TOP_ZONE: {sym} at {pct:.0%} of 1h high")
-            return True
-        return False
+        data = onchainos_data("wallet", "balance", "--chain", "501")
+        if not data:
+            feed("  Takeover: no balance data")
+            return
+
+        assets = []
+        if isinstance(data, dict):
+            details = data.get("details", [])
+            if isinstance(details, list):
+                for detail in details:
+                    token_assets = detail.get("tokenAssets", [])
+                    if isinstance(token_assets, list):
+                        assets.extend(token_assets)
+        elif isinstance(data, list):
+            assets = data
+
+        taken = 0
+        for asset in assets:
+            addr = asset.get("tokenAddress", "")
+            sym = (asset.get("symbol") or "").upper()
+            bal = safe_float(asset.get("balance", 0))
+
+            # Skip native SOL, USDC, WSOL, stablecoins
+            if not addr or addr in _NEVER_TRADE:
+                continue
+            if sym in ("SOL", "USDC", "USDT", "WSOL"):
+                continue
+            if bal <= 0:
+                continue
+
+            # Skip if already tracked
+            with pos_lock:
+                if addr in state["positions"]:
+                    continue
+
+            # Get current price
+            pi = get_token_price(addr)
+            price = safe_float(pi.get("price", 0))
+            mc = safe_float(pi.get("marketCap", 0))
+            liq = safe_float(pi.get("liquidity", 0))
+
+            # Skip dust
+            value_usd = bal * price if price > 0 else 0
+            if value_usd < config.MIN_POSITION_VALUE:
+                continue
+
+            # Inject as takeover position
+            with pos_lock:
+                state["positions"][addr] = {
+                    "symbol": sym or asset.get("tokenSymbol", addr[:8]),
+                    "address": addr,
+                    "tier": "takeover",
+                    "size_usd": value_usd,
+                    "entry_price": price,
+                    "peak_price": price,
+                    "token_amount": bal,
+                    "entry_mc": mc,
+                    "entry_liq": liq,
+                    "opened_at": datetime.now(timezone.utc).isoformat(),
+                    "opened_at_ts": time.time(),
+                    "tp_tier": 0,
+                    "zero_count": 0,
+                    "sell_fail_count": 0,
+                    "last_peak_ts": time.time(),
+                    "last_liq_check": 0,
+                    "risk_last_checked": 0,
+                    "entry_top10": 0,
+                    "entry_sniper_pct": 0,
+                }
+            taken += 1
+
+        with pos_lock:
+            save_positions()
+        feed(f"  Takeover complete: {taken} positions")
+
     except Exception as e:
-        log(f"  WARN check_top_zone: {e} (fail-open)")
-        return False
+        feed(f"  Takeover error: {e}")
 
 
-# ─── Tier B：MIGRATING 毕业伏击信号引擎 ──────────────────────────────────────
+def _create_position(addr, symbol, tier, size_usd, price, mc, liq,
+                     token_amount, tx_hash, rc):
+    """Create a new position record."""
+    now = time.time()
+    entry_top10 = 0
+    entry_sniper = 0
+    if rc and rc.get("raw"):
+        info = rc["raw"].get("info", {})
+        entry_top10 = safe_float(info.get("top10HoldPercent", 0))
+        entry_sniper = safe_float(info.get("sniperHoldingPercent", 0))
 
-def fetch_migrating_tokens():
-    """
-    调用 onchainos memepump tokens MIGRATING，过滤健康候选。
-    过滤条件：
-      - bondingPercent 70-97
-      - devHoldingsPercent == 0 (dev 已出局)
-      - insidersPercent < 30
-      - top10HoldingsPercent < 40
-      - aped >= 1 (至少 1 个 SM 钱包跟单)
-      - 有社交媒体 (x OR telegram OR website 非空)
-      - buyTxCount1h > sellTxCount1h (买盘强于卖盘)
-    返回候选列表
-    """
-    cmd = (
-        "onchainos memepump tokens "
-        "--chain solana --stage MIGRATING --dev-sell-all true "
-        f"--min-bonding-percent {MIN_BONDING} --max-bonding-percent {MAX_BONDING}"
-    )
-    out = run(cmd, timeout=30)
-    d = jparse(out)
-    items = d.get("data", [])
-    if isinstance(items, dict):
-        items = items.get("list", [])
+    with pos_lock:
+        state["positions"][addr] = {
+            "symbol": symbol,
+            "address": addr,
+            "tier": tier,
+            "size_usd": size_usd,
+            "entry_price": price if price > 0 else 0.0001,
+            "peak_price": price if price > 0 else 0.0001,
+            "token_amount": token_amount,
+            "entry_mc": mc,
+            "entry_liq": liq,
+            "tx_hash": tx_hash or "",
+            "opened_at": datetime.now(timezone.utc).isoformat(),
+            "opened_at_ts": now,
+            "tp_tier": 0,
+            "zero_count": 0,
+            "sell_fail_count": 0,
+            "last_peak_ts": now,
+            "last_liq_check": 0,
+            "risk_last_checked": 0,
+            "entry_top10": entry_top10,
+            "entry_sniper_pct": entry_sniper,
+            "pnl_pct": 0.0,
+            "age_min": 0.0,
+        }
+        save_positions()
 
-    candidates = []
-    for t in (items or []):
-        bonding   = sf(t.get("bondingPercent", 0))
-        dev_hold  = sf(t.get("tags", {}).get("devHoldingsPercent", 1))
-        insiders  = sf(t.get("tags", {}).get("insidersPercent", 100))
-        top10     = sf(t.get("tags", {}).get("top10HoldingsPercent", 100))
-        aped      = int(sf(t.get("aped", 0)))
-        buy_tx    = int(sf(t.get("market", {}).get("buyTxCount1h", 0)))
-        sell_tx   = int(sf(t.get("market", {}).get("sellTxCount1h", 0)))
-        social    = t.get("social", {})
-        has_social = any([
-            social.get("x", ""),
-            social.get("telegram", ""),
-            social.get("website", ""),
-        ])
-        addr = t.get("tokenAddress", "")
-        sym  = t.get("symbol", "?")
-        mc   = sf(t.get("market", {}).get("marketCapUsd", 0))
-
-        if not addr:
-            continue
-        if not (MIN_BONDING <= bonding <= MAX_BONDING):
-            continue
-        if dev_hold != 0:
-            continue
-        if insiders >= MAX_INSIDERS:
-            continue
-        if top10 >= MAX_TOP10_B:
-            continue
-        holders = int(sf(t.get("tags", {}).get("totalHolders", 0)))
-
-        # Breakthrough logic: high buy pressure + enough holders bypasses other filters
-        if buy_tx >= 100 and holders >= 80:
-            log(f"  TIER_B_BREAKTHROUGH {sym}: buy_tx={buy_tx} holders={holders} — bypassing filters")
-            t["tokenAddress"] = addr
-            t["_sym"] = sym
-            t["_mc"] = mc
-            candidates.append(t)
-            continue
-
-        if aped < TIER_B_MIN_APED:
-            log(f"  TIER_B_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
-            continue
-        if mc < TIER_B_MIN_MC:
-            log(f"  TIER_B_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
-            continue
-        if holders < TIER_B_MIN_HOLDERS:
-            log(f"  TIER_B_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
-            continue
-        if not has_social:
-            log(f"  TIER_B_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
-            continue
-        if sell_tx == 0 and buy_tx < 3:
-            log(f"  TIER_B_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
-            continue
-        if sell_tx > 0 and buy_tx <= sell_tx:
-            log(f"  TIER_B_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
-            continue
-
-        t["tokenAddress"] = addr
-        t["_sym"] = sym
-        t["_mc"]  = mc
-        candidates.append(t)
-
-    return candidates
+    with state_lock:
+        state["stats"]["buys"] += 1
 
 
-# ─── Tier C：EARLY MIGRATING 早期毕业预埋信号引擎 ─────────────────────────────
-
-def fetch_early_migrating_tokens():
-    """
-    调用 onchainos memepump tokens MIGRATING，过滤早期毕业候选（30-65% bonding）。
-    Tier C 策略：早期毕业前段埋伏，等待 bonding 曲线继续爬升。
-    过滤条件：
-      - bondingPercent 30-65
-      - devHoldingsPercent == 0 (dev 已出局)
-      - insidersPercent < 20 (更严格)
-      - MC $5k-$15k
-      - totalHolders >= 20
-      - aped >= 1
-      - 有社交媒体
-      - buyTxCount1h >= 5 且 buy_tx > sell_tx * 1.5（买盘显著强于卖盘）
-    返回候选列表
-    """
-    cmd = (
-        "onchainos memepump tokens "
-        "--chain solana --stage MIGRATING --dev-sell-all true "
-        f"--min-bonding-percent {MIN_BONDING_C} --max-bonding-percent {MAX_BONDING_C}"
-    )
-    out = run(cmd, timeout=30)
-    d = jparse(out)
-    items = d.get("data", [])
-    if isinstance(items, dict):
-        items = items.get("list", [])
-
-    candidates = []
-    for t in (items or []):
-        bonding   = sf(t.get("bondingPercent", 0))
-        dev_hold  = sf(t.get("tags", {}).get("devHoldingsPercent", 1))
-        insiders  = sf(t.get("tags", {}).get("insidersPercent", 100))
-        holders   = int(sf(t.get("tags", {}).get("totalHolders", 0)))
-        aped      = int(sf(t.get("aped", 0)))
-        buy_tx    = int(sf(t.get("market", {}).get("buyTxCount1h", 0)))
-        sell_tx   = int(sf(t.get("market", {}).get("sellTxCount1h", 0)))
-        social    = t.get("social", {})
-        has_social = any([
-            social.get("x", ""),
-            social.get("telegram", ""),
-            social.get("website", ""),
-        ])
-        addr = t.get("tokenAddress", "")
-        sym  = t.get("symbol", "?")
-        mc   = sf(t.get("market", {}).get("marketCapUsd", 0))
-
-        if not addr:
-            continue
-        if not (MIN_BONDING_C <= bonding <= MAX_BONDING_C):
-            continue
-        if dev_hold != 0:
-            continue
-        if insiders >= 20:
-            continue
-        if not (TIER_C_MIN_MC <= mc <= TIER_C_MAX_MC):
-            log(f"  TIER_C_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
-            continue
-        if holders < TIER_C_MIN_HOLDERS:
-            log(f"  TIER_C_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
-            continue
-        if aped < 1:
-            log(f"  TIER_C_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
-            continue
-        if not has_social:
-            log(f"  TIER_C_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
-            continue
-        if buy_tx < TIER_C_MIN_BUY_TX:
-            log(f"  TIER_C_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
-            continue
-        # buy pressure must be significantly stronger than sell
-        if sell_tx == 0 and buy_tx < 5:
-            log(f"  TIER_C_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
-            continue
-        if sell_tx > 0 and buy_tx <= sell_tx * 1.5:
-            log(f"  TIER_C_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
-            continue
-
-        t["tokenAddress"] = addr
-        t["_sym"] = sym
-        t["_mc"]  = mc
-        candidates.append(t)
-
-    return candidates
+def _create_unconfirmed_position(addr, symbol, tier, size_usd, price, mc):
+    """Create an unconfirmed position (swap timeout)."""
+    now = time.time()
+    with pos_lock:
+        state["positions"][addr] = {
+            "symbol": symbol,
+            "address": addr,
+            "tier": tier,
+            "size_usd": size_usd,
+            "entry_price": price if price > 0 else 0.0001,
+            "peak_price": price if price > 0 else 0.0001,
+            "token_amount": 0,
+            "entry_mc": mc,
+            "entry_liq": 0,
+            "opened_at": datetime.now(timezone.utc).isoformat(),
+            "opened_at_ts": now,
+            "tp_tier": 0,
+            "zero_count": 0,
+            "sell_fail_count": 0,
+            "last_peak_ts": now,
+            "last_liq_check": 0,
+            "risk_last_checked": 0,
+            "entry_top10": 0,
+            "entry_sniper_pct": 0,
+            "unconfirmed": True,
+            "unconfirmed_ts": now,
+            "unconfirmed_checks": 0,
+        }
+        save_positions()
 
 
-# ─── 安全检查 ─────────────────────────────────────────────────────────────────
-
-def security_check(addr):
-    """
-    onchainos security token-scan，返回 (True, 'PASS') 或 (False, reason)
-    拒绝：isHoneypot / riskLevel==HIGH / isWash / isMintable
-    """
-    out = run(f"onchainos security token-scan --tokens '501:{addr}'", timeout=20)
-    d = jparse(out)
-    items = d.get("data", [])
-    if not items:
-        log(f"  WARN security_check: no data for {addr[:12]}, passing (fail-open)")
-        return True, "PASS (no data)"
-    r = items[0] if isinstance(items, list) else items
-    if r.get("isHoneypot"):
-        return False, "honeypot"
-    if r.get("riskLevel") == "HIGH":
-        return False, "HIGH_risk"
-    if r.get("isWash"):
-        return False, "wash_trading"
-    if r.get("isMintable"):
-        return False, "mintable"
-    return True, "PASS"
-
-
-def check_sm_exiting(addr):
-    """
-    gmgn-cli token traders，检查 SM 是否正在出货。
-    如果顶部 smart_degen 钱包 sell_volume_cur > buy_volume_cur * 1.3 → True
-    """
-    out = run(
-        f"gmgn-cli token traders --chain sol --address {addr} "
-        f"--tag smart_degen --order-by sell_volume_cur --direction desc --limit 5 --raw",
-        timeout=20
-    )
-    d = jparse(out)
-    traders = d.get("list", [])
-    if not traders:
-        log(f"  WARN: check_sm_exiting returned empty traders for {addr} — treating as not-exiting")
-        return False
-    top = traders[0]
-    sv = sf(top.get("sell_volume_cur"))
-    bv = sf(top.get("buy_volume_cur"))
-    if bv > 0 and sv > bv * 1.3:
-        log(f"  SM 出货确认: sell=${sv:.0f} > buy=${bv:.0f}*1.3")
-        return True
+def _k1_pump_guard(addr, max_pct):
+    """Check if 1m candle shows >max_pct pump (chasing protection)."""
+    try:
+        data = onchainos_data("market", "candles",
+                              "--chain", "solana",
+                              "--address", addr,
+                              "--bar", "1m")
+        if isinstance(data, list) and len(data) >= 2:
+            k1 = data[-1]
+            k1_open = safe_float(k1.get("o", 0))
+            k1_close = safe_float(k1.get("c", 0))
+            if k1_open > 0:
+                k1_pct = (k1_close - k1_open) / k1_open * 100
+                if k1_pct > max_pct:
+                    return True
+    except Exception:
+        pass
     return False
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 12: Web Dashboard
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ─── 入场守卫 ─────────────────────────────────────────────────────────────────
-
-def entry_guard(positions, daily_state, usdc, tier, addr=None, score=None):
-    """
-    所有入场前检查，返回 (True, size) 或 (False, reason)
-    """
-    # v5.1: session consecutive loss pause
-    if time.time() < session_state['pause_until']:
-        remaining = session_state['pause_until'] - time.time()
-        return False, f"session_paused {remaining:.0f}s left"
-
-    # v5.1: signal cooldown dedup
-    if addr and time.time() < cooldown_until.get(addr, 0):
-        remaining = cooldown_until[addr] - time.time()
-        return False, f"cooldown {remaining:.0f}s left"
-
-    safety = get_safety_line()
-    night = is_night_time()
-
-    if usdc < safety:
-        return False, f"safety_line ${usdc:.1f}<${safety}"
-    if len(positions) >= MAX_POSITIONS:
-        return False, f"max_positions {len(positions)}/{MAX_POSITIONS}"
-    if daily_state.get("halted") or daily_state["realized_pnl"] < -DAILY_LOSS_LIMIT:
-        return False, f"halted/daily_loss_limit ${daily_state['realized_pnl']:.2f}"
-
-    tier_upper = tier.upper() if isinstance(tier, str) else ""
-
-    if "C" in tier_upper:
-        if night:
-            return False, "tier_c_disabled_night"
-        if daily_state["tier_c_count"] >= MAX_TIER_C_DAY:
-            return False, f"tier_c_day_limit {daily_state['tier_c_count']}/{MAX_TIER_C_DAY}"
-        if time.time() < daily_state["tier_c_pause_until"]:
-            remaining = daily_state["tier_c_pause_until"] - time.time()
-            return False, f"tier_c_cooldown {remaining/60:.0f}min left"
-        size = score_to_size(score, "C", night) if score is not None else TIER_C_SIZE
-    elif "D" in tier_upper:
-        size = score_to_size(score, "D", night) if score is not None else (TIER_D_NIGHT if night else TIER_D_SIZE)
-    elif "B" in tier_upper:
-        size = score_to_size(score, "B", night) if score is not None else (TIER_B_NIGHT if night else TIER_B_SIZE)
-    elif "A" in tier_upper or "takeover" in tier_upper.lower():
-        size = TIER_A_NIGHT if night else TIER_A_SIZE
-    else:
-        size = TIER_A_SIZE
-
-    if usdc < size:
-        return False, f"insufficient_usdc ${usdc:.1f}<${size}"
-
-    return True, size
+_dashboard_html_path = PROJECT_DIR / "dashboard.html"
 
 
-def calculate_position_score(holders, aped, buy_tx, sell_tx, unique_traders=0, change_pct=0):
-    """Calculate a score 0-100 to determine position size."""
-    score = 0
-    if holders >= 200: score += 30
-    elif holders >= 100: score += 20
-    elif holders >= 50: score += 10
-    if aped >= 5: score += 30
-    elif aped >= 3: score += 20
-    elif aped >= 1: score += 10
-    if sell_tx > 0:
-        ratio = buy_tx / sell_tx
-        if ratio >= 2.0: score += 25
-        elif ratio >= 1.5: score += 15
-        elif ratio >= 1.2: score += 10
-    elif buy_tx >= 10:
-        score += 20
-    if unique_traders >= 500: score += 15
-    elif unique_traders >= 200: score += 10
-    elif unique_traders >= 100: score += 5
-    # 涨幅加分（Tier D 专用）
-    if change_pct >= 20: score += 15
-    elif change_pct >= 10: score += 10
-    elif change_pct >= 5: score += 5
-    return min(100, score)
+class DashboardHandler(BaseHTTPRequestHandler):
+    """Simple HTTP handler for dashboard."""
+
+    def log_message(self, *args):
+        pass  # Suppress default access logs
+
+    def do_GET(self):
+        if self.path == "/api/state":
+            self._serve_api()
+        elif self.path in ("/", "/index.html"):
+            self._serve_html()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _serve_api(self):
+        """Serve JSON state for dashboard."""
+        with state_lock:
+            snap = {
+                "feed": list(state["feed"]),
+                "stats": dict(state["stats"]),
+            }
+        with pos_lock:
+            snap["positions"] = dict(state["positions"])
+        with trades_lock:
+            snap["trades"] = list(state["trades"][:50])
+        snap["session_risk"] = dict(session_risk)
+        snap["config"] = {
+            "paused": config.PAUSED,
+            "paper_trade": config.PAPER_TRADE,
+            "max_positions": config.MAX_POSITIONS,
+            "night_mode": is_night(),
+        }
+
+        body = json.dumps(snap, ensure_ascii=False, default=str).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_html(self):
+        """Serve dashboard HTML."""
+        try:
+            html = _dashboard_html_path.read_text()
+        except FileNotFoundError:
+            html = ("<html><body><h1>SOL Meme Hunter v6.0 Dashboard</h1>"
+                    "<p>dashboard.html not found. API available at /api/state</p>"
+                    "</body></html>")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(html.encode())
 
 
-def score_to_size(score, tier, is_night):
-    """Convert score to position size in USD."""
-    if "D" in tier.upper():
-        base = TIER_D_NIGHT if is_night else TIER_D_SIZE
-        if score >= 70: return base + 3
-        if score >= 55: return base + 1
-        return base
-    elif "B" in tier.upper():
-        base = TIER_B_NIGHT if is_night else TIER_B_SIZE
-        if score >= 70: return base + 3
-        if score >= 55: return base + 1
-        return max(2, base - 1)
-    elif "C" in tier.upper():
-        if score >= 70: return 4
-        if score >= 55: return 3
-        return 2
-    else:  # Tier A
-        base = TIER_A_NIGHT if is_night else TIER_A_SIZE
-        return base
-
-
-# ─── 持仓监控与 TP/SL ────────────────────────────────────────────────────────
-
-def _record_sell_outcome(pnl_usd, addr):
-    """
-    记录卖出结果：更新 session 连续亏损计数 + 设置冷却。
-    在每一次 sell 成功后调用。
-    """
-    # cooldown dedup: 30 分钟内不重入
-    cooldown_until[addr] = time.time() + 1800
-
-    # session consecutive loss tracking
-    if pnl_usd < 0:
-        session_state['consecutive_losses'] += 1
-        if session_state['consecutive_losses'] >= SESSION_CONSEC_LOSS_MAX:
-            session_state['pause_until'] = time.time() + SESSION_CONSEC_PAUSE
-            log(f"  SESSION_PAUSE: {SESSION_CONSEC_LOSS_MAX} consecutive losses, pausing {SESSION_CONSEC_PAUSE//60}min")
-    else:
-        session_state['consecutive_losses'] = 0
-    save_session_state()
-
-def check_positions(positions, daily_state):
-    """
-    主持仓监控，按层级规则执行止盈止损。
-    v5.1 新增（按优先级顺序）：
-      1. FAST_DUMP    — 从峰值下跌 >=15% 且当前亏损 → 立即清仓
-      2. LIQ_EMERGENCY — 每 5 分钟检查流动性，< $5000 清仓
-      3. Time-decay SL — 超时仍亏损提前离场
-      4. Trailing Stop — TP1 后从峰值回撤清仓
-      5. 原有 TP/SL 逻辑
-    3-check protection: get_token_price 返回 0 时累计，>=3 次才执行紧急操作。
-    """
-    if not positions:
+def start_dashboard():
+    """Start dashboard HTTP server in daemon thread."""
+    if not config.DASHBOARD_ENABLED:
         return
-    now = time.time()
-    for addr in list(positions.keys()):
-        if addr not in positions:
-            continue
-        pos        = positions[addr]
-        sym        = pos["sym"]
-        tier       = pos.get("tier", "takeover").upper()
-        entry      = pos.get("entry_price", 0)
-        amt_usd    = pos.get("amount_usd", 0)
-        amt_tokens = pos.get("amount_tokens", 0)
-        entry_time = pos.get("entry_time", now)
-        age_h      = (now - entry_time) / 3600
-        age_min    = age_h * 60
-
-        cur = get_token_price(addr)
-
-        # ── 3-check protection ──────────────────────────────────────────────
-        if not cur:
-            pos['zero_price_count'] = pos.get('zero_price_count', 0) + 1
-            n = pos['zero_price_count']
-            log(f"  price_zero [{n}/10] {sym}")
-            if n < 10:
-                # Not yet confirmed zero — only act on Tier C timeout after 10 confirms
-                if ("C" in tier) and age_min > TIER_C_TIMEOUT_MIN and not pos.get("timeout_done"):
-                    log(f"  timeout Tier C {sym} ({age_min:.1f}min) — no price data (waiting {n}/10)")
-                continue
-            # zero_price_count >= 10: proceed with emergency action
-            if ("C" in tier) and age_min > TIER_C_TIMEOUT_MIN and not pos.get("timeout_done"):
-                log(f"  timeout Tier C {sym} ({age_min:.1f}min) — no price data")
-                ok, _ = sell_token(addr, sym, amt_tokens, "Tier_C_timeout_no_price")
-                if ok:
-                    pnl_usd_val = 0.0
-                    add_realized_pnl(daily_state, pnl_usd_val)
-                    _record_sell_outcome(pnl_usd_val, addr)
-                    daily_state["tier_c_count"] = daily_state.get("tier_c_count", 0) + 1
-                    daily_state["tier_c_consecutive_losses"] = daily_state.get("tier_c_consecutive_losses", 0) + 1
-                    if daily_state["tier_c_consecutive_losses"] >= 2:
-                        daily_state["tier_c_pause_until"] = time.time() + TIER_C_COOLDOWN
-                        log(f"  Tier C 连续亏损 2 次，冷却 {TIER_C_COOLDOWN/3600:.0f}h")
-                    del positions[addr]
-            else:
-                log(f"  ? {tier} {sym}: no price data (10+ zeros) age={age_h:.1f}h")
-            continue
-
-        # Price obtained — reset zero counter
-        pos['zero_price_count'] = 0
-
-        if not entry or not amt_tokens:
-            log(f"  ? {tier} {sym}: no entry data age={age_h:.1f}h")
-            continue
-
-        # Update peak_price
-        peak = max(pos.get('peak_price', entry), cur)
-        pos['peak_price'] = peak
-
-        pnl_pct = (cur - entry) / entry if entry > 0 else 0
-        cur_val  = amt_tokens * cur
-        pnl_usd  = cur_val - amt_usd
-
-        # 标准日志格式
-        x_mult = 1 + pnl_pct
-        log(
-            f"  {tier} {sym}: entry=${amt_usd:.1f}({amt_tokens:.0f}t) "
-            f"now=${cur_val:.2f} {x_mult:.2f}x "
-            f"PnL={pnl_pct:+.1%}(${pnl_usd:+.2f}) age={age_h:.1f}h"
-        )
-
-        # ── FAST_DUMP (highest priority) ────────────────────────────────────
-        # Fix 3: continue only on success; fall through to LIQ check on failure
-        if peak > 0 and (peak - cur) / peak >= 0.15 and cur < entry:
-            drop = (peak - cur) / peak
-            log(f"  FAST_DUMP {sym}: peak=${peak:.6f} cur=${cur:.6f} drop={drop:.1%}")
-            ok, _ = sell_token(addr, sym, pos["amount_tokens"], "FAST_DUMP")
-            if ok:
-                realized = pos["amount_tokens"] * cur - amt_usd
-                add_realized_pnl(daily_state, realized)
-                _record_sell_outcome(realized, addr)
-                if "C" in tier:
-                    daily_state["tier_c_consecutive_losses"] = daily_state.get("tier_c_consecutive_losses", 0) + 1
-                    if daily_state["tier_c_consecutive_losses"] >= 2:
-                        daily_state["tier_c_pause_until"] = time.time() + TIER_C_COOLDOWN
-                del positions[addr]
-                continue
-            # sell failed: log and fall through to LIQ_EMERGENCY
-            log(f"  FAST_DUMP sell failed for {sym}, falling through to LIQ check")
-
-        # ── Liquidity Emergency Exit (every 5 min per position) ─────────────
-        # Fix 3: continue only on success; fall through to time-decay checks on failure
-        if now - pos.get('last_liq_check', 0) > 300:
-            pos['last_liq_check'] = now
-            try:
-                liq_out = run(f"onchainos market prices --tokens 501:{addr}", timeout=15)
-                liq_d = jparse(liq_out)
-                liq_items = liq_d.get("data", [])
-                if isinstance(liq_items, list) and liq_items:
-                    liq = sf(liq_items[0].get("liquidity", liq_items[0].get("liquidityUsd", 999999)))
-                elif isinstance(liq_items, dict):
-                    liq = sf(liq_items.get("liquidity", liq_items.get("liquidityUsd", 999999)))
-                else:
-                    liq = 999999
-                if 0 < liq < 5000:
-                    log(f"  LIQ_EMERGENCY {sym}: liq=${liq:.0f} < $5000")
-                    ok, _ = sell_token(addr, sym, pos["amount_tokens"], "LIQ_EMERGENCY")
-                    if ok:
-                        realized = pos["amount_tokens"] * cur - amt_usd
-                        add_realized_pnl(daily_state, realized)
-                        _record_sell_outcome(realized, addr)
-                        del positions[addr]
-                        continue
-                    # sell failed: log and fall through to tier-dispatch checks
-                    log(f"  LIQ_EMERGENCY sell failed for {sym}, falling through to tier checks")
-            except Exception:
-                pass  # fail-open
-
-        # ── Time-decay SL (before tp1_done) ─────────────────────────────────
-        if not pos.get("tp1_done"):
-            _time_decay_triggered = False
-            for decay_min, decay_thresh in TIME_DECAY_SL:
-                if age_min > decay_min and pnl_pct < decay_thresh:
-                    reason = f"TimeDecaySL_{age_min:.0f}min"
-                    log(f"  TIME_DECAY_SL {sym}: age={age_min:.0f}min pnl={pnl_pct:.1%} < {decay_thresh:.0%}")
-                    ok, _ = sell_token(addr, sym, pos["amount_tokens"], reason)
-                    if ok:
-                        realized = pos["amount_tokens"] * cur - amt_usd
-                        add_realized_pnl(daily_state, realized)
-                        _record_sell_outcome(realized, addr)
-                        if "C" in tier:
-                            daily_state["tier_c_consecutive_losses"] = daily_state.get("tier_c_consecutive_losses", 0) + 1
-                            if daily_state["tier_c_consecutive_losses"] >= 2:
-                                daily_state["tier_c_pause_until"] = time.time() + TIER_C_COOLDOWN
-                        del positions[addr]
-                        _time_decay_triggered = True   # FIXED: only fires on successful sell
-                    break
-            if _time_decay_triggered:
-                continue
-
-        # ── Tier A / takeover TP/SL ──────────────────────────────────────────
-        if "A" in tier or "TAKEOVER" in tier:
-            # TP1: +50% → 卖 75%
-            if pnl_pct >= 0.50 and not pos.get("tp1_done"):
-                sell_amt = amt_tokens * 0.75
-                ok, _ = sell_token(addr, sym, sell_amt, f"Tier_A_TP1 +{pnl_pct:.0%}")
-                if ok:
-                    sold_usd = sell_amt * cur
-                    realized = sold_usd - amt_usd * 0.75
-                    add_realized_pnl(daily_state, realized)
-                    _record_sell_outcome(realized, addr)
-                    pos["tp1_done"]      = True
-                    pos["amount_tokens"] = amt_tokens * 0.25
-                    pos["amount_usd"]    = amt_usd * 0.25
-                    log(f"  Tier A TP1 done, 底仓 {pos['amount_tokens']:.0f}t (${pos['amount_usd']:.1f})")
-                continue
-
-            # Trailing Stop after TP1 (Tier A: 12% drawdown from peak, must be profitable)
-            if pos.get("tp1_done"):
-                if peak > 0 and (peak - cur) / peak >= TRAIL_DISTANCE_A and cur > entry:
-                    log(f"  TrailingStop TIER_A {sym}: peak=${peak:.6f} cur=${cur:.6f} drawdown={(peak-cur)/peak:.1%}")
-                    ok, _ = sell_token(addr, sym, pos["amount_tokens"], "TrailingStop")
-                    if ok:
-                        realized = pos["amount_tokens"] * cur - pos["amount_usd"]
-                        add_realized_pnl(daily_state, realized)
-                        _record_sell_outcome(realized, addr)
-                        del positions[addr]
-                    continue
-
-            # TP2: +150% 且 tp1 已完成 → 再卖底仓 50%
-            if pnl_pct >= 1.50 and pos.get("tp1_done") and not pos.get("tp2_done"):
-                sell_amt = pos["amount_tokens"] * 0.50
-                ok, _ = sell_token(addr, sym, sell_amt, f"Tier_A_TP2 +{pnl_pct:.0%}")
-                if ok:
-                    sold_usd = sell_amt * cur
-                    realized = sold_usd - pos["amount_usd"] * 0.50
-                    add_realized_pnl(daily_state, realized)
-                    _record_sell_outcome(realized, addr)
-                    pos["tp2_done"]      = True
-                    pos["amount_tokens"] = pos["amount_tokens"] * 0.50
-                    pos["amount_usd"]    = pos["amount_usd"] * 0.50
-                    log(f"  Tier A TP2 done, 底仓 {pos['amount_tokens']:.0f}t (${pos['amount_usd']:.1f})")
-                continue
-
-            # TP3: +300% 且 tp2 已完成 → 再卖剩余 50%
-            if pnl_pct >= 3.00 and pos.get("tp2_done") and not pos.get("tp3_done"):
-                sell_amt = pos["amount_tokens"] * 0.50
-                ok, _ = sell_token(addr, sym, sell_amt, f"Tier_A_TP3 +{pnl_pct:.0%}")
-                if ok:
-                    sold_usd = sell_amt * cur
-                    realized = sold_usd - pos["amount_usd"] * 0.50
-                    add_realized_pnl(daily_state, realized)
-                    _record_sell_outcome(realized, addr)
-                    pos["tp3_done"]      = True
-                    pos["amount_tokens"] = pos["amount_tokens"] * 0.50
-                    pos["amount_usd"]    = pos["amount_usd"] * 0.50
-                    log(f"  Tier A TP3 done, 月球底仓 {pos['amount_tokens']:.0f}t (${pos['amount_usd']:.1f})")
-                continue
-
-            # SL: -35% 且 tp1 未触发
-            if pnl_pct <= -0.35 and not pos.get("tp1_done") and not pos.get("sl_checked"):
-                pos["sl_checked"] = True
-                log(f"  Tier A SL 触发 {pnl_pct:.0%}，检查 SM 出货...")
-                if check_sm_exiting(addr):
-                    ok, _ = sell_token(addr, sym, pos["amount_tokens"], f"Tier_A_SL_SM_exit {pnl_pct:.0%}")
-                    if ok:
-                        realized = pos["amount_tokens"] * cur - pos["amount_usd"]
-                        add_realized_pnl(daily_state, realized)
-                        _record_sell_outcome(realized, addr)
-                        del positions[addr]
-                else:
-                    log(f"  SM 未出货，持有至 -45%")
-                continue
-
-            # SL 二级止损：-45% 且 SM 未出货时仍亏损到 -45%
-            if pnl_pct <= -0.45 and not pos.get("tp1_done") and not pos.get("sl_done"):
-                ok, _ = sell_token(addr, sym, pos["amount_tokens"], f"Tier_A_SL_45 {pnl_pct:.0%}")
-                if ok:
-                    realized = pos["amount_tokens"] * cur - pos["amount_usd"]
-                    add_realized_pnl(daily_state, realized)
-                    _record_sell_outcome(realized, addr)
-                    pos["sl_done"] = True
-                    del positions[addr]
-                continue
-
-            # 超时：48h 无 tp1 → 清仓
-            if age_h > 48 and not pos.get("tp1_done") and not pos.get("timeout_done"):
-                ok, _ = sell_token(addr, sym, pos["amount_tokens"], f"Tier_A_timeout {age_h:.0f}h")
-                if ok:
-                    realized = pos["amount_tokens"] * cur - pos["amount_usd"]
-                    add_realized_pnl(daily_state, realized)
-                    _record_sell_outcome(realized, addr)
-                    pos["timeout_done"] = True
-                    del positions[addr]
-                continue
-        elif "B" in tier:
-            # TP1: +40% → 卖 70%
-            if pnl_pct >= 0.40 and not pos.get("tp1_done"):
-                sell_amt = amt_tokens * 0.70
-                ok, _ = sell_token(addr, sym, sell_amt, f"Tier_B_TP1 +{pnl_pct:.0%}")
-                if ok:
-                    sold_usd = sell_amt * cur
-                    realized = sold_usd - amt_usd * 0.70
-                    add_realized_pnl(daily_state, realized)
-                    _record_sell_outcome(realized, addr)
-                    pos["tp1_done"]      = True
-                    pos["amount_tokens"] = amt_tokens * 0.30
-                    pos["amount_usd"]    = amt_usd * 0.30
-                    log(f"  Tier B TP1 done, 剩余 {pos['amount_tokens']:.0f}t")
-                continue
-
-            # Trailing Stop after TP1 (Tier B: 10% drawdown from peak, must be profitable)
-            if pos.get("tp1_done"):
-                if peak > 0 and (peak - cur) / peak >= TRAIL_DISTANCE_B and cur > entry:
-                    log(f"  TrailingStop TIER_B {sym}: peak=${peak:.6f} cur=${cur:.6f} drawdown={(peak-cur)/peak:.1%}")
-                    ok, _ = sell_token(addr, sym, pos["amount_tokens"], "TrailingStop")
-                    if ok:
-                        realized = pos["amount_tokens"] * cur - pos["amount_usd"]
-                        add_realized_pnl(daily_state, realized)
-                        _record_sell_outcome(realized, addr)
-                        del positions[addr]
-                    continue
-
-            # TP2: +100% 且 tp1 完成 → 再卖剩余 50%
-            if pnl_pct >= 1.00 and pos.get("tp1_done") and not pos.get("tp2_done"):
-                sell_amt = pos["amount_tokens"] * 0.50
-                ok, _ = sell_token(addr, sym, sell_amt, f"Tier_B_TP2 +{pnl_pct:.0%}")
-                if ok:
-                    sold_usd = sell_amt * cur
-                    realized = sold_usd - pos["amount_usd"] * 0.50
-                    add_realized_pnl(daily_state, realized)
-                    _record_sell_outcome(realized, addr)
-                    pos["tp2_done"]      = True
-                    pos["amount_tokens"] = pos["amount_tokens"] * 0.50
-                    pos["amount_usd"]    = pos["amount_usd"] * 0.50
-                    log(f"  Tier B TP2 done, 剩余 {pos['amount_tokens']:.0f}t")
-                continue
-
-            # SL: -25% → 全清
-            if pnl_pct <= -0.25 and not pos.get("sl_done"):
-                ok, _ = sell_token(addr, sym, pos["amount_tokens"], f"Tier_B_SL {pnl_pct:.0%}")
-                if ok:
-                    realized = pos["amount_tokens"] * cur - pos["amount_usd"]
-                    add_realized_pnl(daily_state, realized)
-                    _record_sell_outcome(realized, addr)
-                    pos["sl_done"] = True
-                    del positions[addr]
-                continue
-
-            # 超时：12h → 全清
-            if age_h > 12 and not pos.get("timeout_done"):
-                ok, _ = sell_token(addr, sym, pos["amount_tokens"], f"Tier_B_timeout {age_h:.0f}h")
-                if ok:
-                    realized = pos["amount_tokens"] * cur - pos["amount_usd"]
-                    add_realized_pnl(daily_state, realized)
-                    _record_sell_outcome(realized, addr)
-                    pos["timeout_done"] = True
-                    del positions[addr]
-                continue
-
-        # ── Tier C TP/SL ─────────────────────────────────────────────────────
-        elif "C" in tier:
-            # TP: +40% → 全清
-            if pnl_pct >= 0.40:
-                ok, _ = sell_token(addr, sym, pos["amount_tokens"], f"Tier_C_TP +{pnl_pct:.0%} full_exit")
-                if ok:
-                    realized = pos["amount_tokens"] * cur - pos["amount_usd"]
-                    add_realized_pnl(daily_state, realized)
-                    _record_sell_outcome(realized, addr)
-                    if realized >= 0:
-                        daily_state["tier_c_consecutive_losses"] = 0
-                    else:
-                        daily_state["tier_c_consecutive_losses"] = daily_state.get("tier_c_consecutive_losses", 0) + 1
-                    del positions[addr]
-                continue
-
-            # Holder pump TP: holders 增加 >30% 时全清
-            holders_entry = pos.get("holders_at_entry", 0)
-            if holders_entry > 0:
-                # 从最近的 memepump 快速确认持有人数（用价格接口代替，此处跳过，仅保留结构）
-                pass
-
-            # SL: -25% → 全清
-            if pnl_pct <= -0.25:
-                ok, _ = sell_token(addr, sym, pos["amount_tokens"], f"Tier_C_SL {pnl_pct:.0%}")
-                if ok:
-                    realized = pos["amount_tokens"] * cur - pos["amount_usd"]
-                    add_realized_pnl(daily_state, realized)
-                    _record_sell_outcome(realized, addr)
-                    daily_state["tier_c_consecutive_losses"] = daily_state.get("tier_c_consecutive_losses", 0) + 1
-                    if daily_state["tier_c_consecutive_losses"] >= 2:
-                        daily_state["tier_c_pause_until"] = time.time() + TIER_C_COOLDOWN
-                        log(f"  Tier C 连续亏损 2 次，冷却 {TIER_C_COOLDOWN/3600:.0f}h")
-                    del positions[addr]
-                continue
-
-            # 超时：TIER_C_TIMEOUT_MIN 分钟 → 全清
-            if age_min > TIER_C_TIMEOUT_MIN and not pos.get("timeout_done"):
-                ok, _ = sell_token(addr, sym, pos["amount_tokens"], f"Tier_C_timeout {age_min:.1f}min")
-                if ok:
-                    realized = pos["amount_tokens"] * cur - pos["amount_usd"]
-                    add_realized_pnl(daily_state, realized)
-                    _record_sell_outcome(realized, addr)
-                    daily_state["tier_c_consecutive_losses"] = daily_state.get("tier_c_consecutive_losses", 0) + 1
-                    if daily_state["tier_c_consecutive_losses"] >= 2:
-                        daily_state["tier_c_pause_until"] = time.time() + TIER_C_COOLDOWN
-                        log(f"  Tier C 连续亏损 2 次，冷却 {TIER_C_COOLDOWN/3600:.0f}h")
-                    pos["timeout_done"] = True
-                    del positions[addr]
-                continue
-
-        elif "D" in tier:
-            # TP1: +15% -> sell 60%
-            if pnl_pct >= 0.15 and not pos.get("tp1_done"):
-                sell_amt = amt_tokens * 0.60
-                ok, _ = sell_token(addr, sym, sell_amt, f"Tier_D_TP1 +{pnl_pct:.0%}")
-                if ok:
-                    sold_usd = sell_amt * cur
-                    realized = sold_usd - amt_usd * 0.60
-                    add_realized_pnl(daily_state, realized)
-                    _record_sell_outcome(realized, addr)
-                    pos["tp1_done"] = True
-                    pos["amount_tokens"] = amt_tokens * 0.40
-                    pos["amount_usd"] = amt_usd * 0.40
-                    log(f"  Tier D TP1 done, remaining {pos['amount_tokens']:.0f}t")
-                continue
-
-            # Trailing Stop after TP1 (8% drawdown)
-            if pos.get("tp1_done"):
-                if peak > 0 and (peak - cur) / peak >= 0.08 and cur > entry:
-                    log(f"  TrailingStop TIER_D {sym}: peak=${peak:.6f} cur=${cur:.6f} drawdown={(peak-cur)/peak:.1%}")
-                    ok, _ = sell_token(addr, sym, pos["amount_tokens"], "TrailingStop_D")
-                    if ok:
-                        realized = pos["amount_tokens"] * cur - pos["amount_usd"]
-                        add_realized_pnl(daily_state, realized)
-                        _record_sell_outcome(realized, addr)
-                        del positions[addr]
-                    continue
-
-            # TP2: +30% and tp1 done -> sell remaining 50%
-            if pnl_pct >= 0.30 and pos.get("tp1_done") and not pos.get("tp2_done"):
-                sell_amt = pos["amount_tokens"] * 0.50
-                ok, _ = sell_token(addr, sym, sell_amt, f"Tier_D_TP2 +{pnl_pct:.0%}")
-                if ok:
-                    sold_usd = sell_amt * cur
-                    realized = sold_usd - pos["amount_usd"] * 0.50
-                    add_realized_pnl(daily_state, realized)
-                    _record_sell_outcome(realized, addr)
-                    pos["tp2_done"] = True
-                    pos["amount_tokens"] = pos["amount_tokens"] * 0.50
-                    pos["amount_usd"] = pos["amount_usd"] * 0.50
-                continue
-
-            # SL: -10% (tight for momentum plays)
-            if pnl_pct <= -0.10 and not pos.get("sl_done"):
-                ok, _ = sell_token(addr, sym, pos["amount_tokens"], f"Tier_D_SL {pnl_pct:.0%}")
-                if ok:
-                    realized = pos["amount_tokens"] * cur - pos["amount_usd"]
-                    add_realized_pnl(daily_state, realized)
-                    _record_sell_outcome(realized, addr)
-                    pos["sl_done"] = True
-                    del positions[addr]
-                continue
-
-            # Timeout: 6h
-            if age_h > 6 and not pos.get("timeout_done"):
-                ok, _ = sell_token(addr, sym, pos["amount_tokens"], f"Tier_D_timeout {age_h:.0f}h")
-                if ok:
-                    realized = pos["amount_tokens"] * cur - pos["amount_usd"]
-                    add_realized_pnl(daily_state, realized)
-                    _record_sell_outcome(realized, addr)
-                    pos["timeout_done"] = True
-                    del positions[addr]
-                continue
+    try:
+        HTTPServer.allow_reuse_address = True
+        server = HTTPServer(("0.0.0.0", config.DASHBOARD_PORT), DashboardHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        feed(f"Dashboard: http://localhost:{config.DASHBOARD_PORT}")
+    except Exception as e:
+        feed(f"Dashboard failed to start: {e}")
 
 
-# ─── 主程序 ───────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 13: Scanner Loop & Main Entry Point
+# ══════════════════════════════════════════════════════════════════════════════
+
+_shutdown = False
+
+
+def scanner_loop():
+    """Main scanning loop. Runs Tier A/B/D on schedule."""
+    last_a = 0
+    last_b = 0
+    last_d = 0
+    last_balance = 0
+    last_daily_reset = datetime.now(timezone.utc).date()
+
+    while not _shutdown:
+        try:
+            now = time.time()
+
+            # Daily reset at UTC midnight
+            today = datetime.now(timezone.utc).date()
+            if today != last_daily_reset:
+                last_daily_reset = today
+                with state_lock:
+                    old_loss = session_risk["cumulative_loss_usd"]
+                    session_risk["consecutive_losses"] = 0
+                    session_risk["cumulative_loss_usd"] = 0.0
+                    session_risk["paused_until"] = 0
+                    session_risk["stopped"] = False
+                save_session()
+                feed(f"  New day {today}, reset session risk (yesterday loss=${old_loss:.2f})")
+
+            # Balance check
+            if now - last_balance >= config.BALANCE_CHECK_SEC:
+                last_balance = now
+                sol_bal = get_sol_balance()
+                sol_price = get_sol_price()
+                usd_bal = sol_bal * sol_price if sol_price > 0 else 0
+                with pos_lock:
+                    n_pos = len(state["positions"])
+                daily_loss = session_risk.get("cumulative_loss_usd", 0)
+                feed(f"SOL: {sol_bal:.4f} (~${usd_bal:.2f}) | "
+                     f"Daily PnL: ${-daily_loss:+.2f} | Positions: {n_pos}")
+
+            # Tier A: Smart Money (every SM_REFRESH_SEC)
+            if now - last_a >= config.SM_REFRESH_SEC:
+                last_a = now
+                try:
+                    process_tier_a()
+                except Exception as e:
+                    feed(f"Tier A error: {e}")
+
+            # Tier B: Graduation Ambush (every GRADUATED_REFRESH_SEC)
+            if now - last_b >= config.GRADUATED_REFRESH_SEC:
+                last_b = now
+                try:
+                    process_tier_b()
+                except Exception as e:
+                    feed(f"Tier B error: {e}")
+
+            # Tier D: Hot Momentum (every HOT_REFRESH_SEC)
+            if now - last_d >= config.HOT_REFRESH_SEC:
+                last_d = now
+                try:
+                    process_tier_d()
+                except Exception as e:
+                    feed(f"Tier D error: {e}")
+
+            with state_lock:
+                state["stats"]["cycle"] += 1
+
+            # Clean expired cooldowns
+            expired = [k for k, v in cooldown_map.items() if now >= v]
+            for k in expired:
+                del cooldown_map[k]
+
+            time.sleep(config.MONITOR_SEC)
+
+        except Exception as e:
+            feed(f"Scanner loop error: {e}")
+            time.sleep(5)
+
 
 def main():
-    # 初始化 daily_state
-    daily_state = {
-        "date":                        "",
-        "realized_pnl":                0.0,
-        "tier_c_count":                0,
-        "tier_c_consecutive_losses":   0,
-        "tier_c_pause_until":          0.0,
-    }
-    hot_cache    = {}
-    hot_cache_ts = 0
+    """Main entry point."""
+    global _shutdown
 
-    last_balance_check    = 0
-    last_sm_check         = 0
-    last_migrating_check  = 0
-    last_new_check        = 0
-    last_pos_check        = 0
-    last_hot_momentum_check = 0
+    print("=" * 60)
+    print("  SOL MEME HUNTER v6.0")
+    print("  3-Tier Architecture (A/B/D) + Dynamic Scoring")
+    print("  Swap: swap swap -> contract-call -> history")
+    print("=" * 60)
 
-    usdc = 200.0
+    # 1. Check onchainos
+    try:
+        ver = onchainos_run("--version")
+        feed(f"onchainos version: {ver.get('data', ver.get('msg', 'unknown'))}")
+    except Exception:
+        feed("WARNING: onchainos --version failed")
 
-    # 持仓接管 + acted 加载 + session state 恢复
-    positions = load_existing_positions()
-    acted     = load_acted()
-    acted.update({addr: time.time() for addr in positions})
-    # Fix 11: restore session state across restarts
-    saved_session = load_session_state()
-    session_state.update(saved_session)
-    save_acted(acted)
+    # 2. Get wallet address
+    wallet = get_wallet_address()
+    if not wallet:
+        feed("FATAL: No wallet address. Run: onchainos wallet login")
+        sys.exit(1)
+    feed(f"Wallet: {wallet}")
 
-    log("=" * 60)
-    log("SOL MEME HUNTER v5.4 — 四层预测架构 + 动态仓位评分")
-    log(f"Wallet: {WALLET}")
-    log(f"Safety  DAY=${SAFETY_LINE_DAY}  NIGHT=${SAFETY_LINE_NIGHT}  DAILY_LOSS_LIMIT=${DAILY_LOSS_LIMIT}")
-    log(f"Tier A size={TIER_A_SIZE}(night={TIER_A_NIGHT})  MC ${SM_MIN_MC}-${SM_MAX_MC}  liq ${SM_MIN_LIQ}-${SM_MAX_LIQ}")
-    log(f"Tier B size={TIER_B_SIZE}(night={TIER_B_NIGHT})  bonding {MIN_BONDING}-{MAX_BONDING}%")
-    log(f"Tier C size={TIER_C_SIZE}  bonding {MIN_BONDING_C}-{MAX_BONDING_C}%  MC ${TIER_C_MIN_MC}-${TIER_C_MAX_MC}  timeout={TIER_C_TIMEOUT_MIN}min  daily_limit={MAX_TIER_C_DAY}")
-    log(f"Tier D size={TIER_D_SIZE}(night={TIER_D_NIGHT})  MC ${TIER_D_MIN_MC//1000}k-${TIER_D_MAX_MC//1000000}M  holders>={TIER_D_MIN_HOLDERS}")
-    log(f"Refresh  SM={SM_REFRESH}s  MIGRATING={MIGRATING_REFRESH}s  NEW={NEW_REFRESH}s  HOT={HOT_REFRESH}s")
-    log(f"v5.4: confidence_scoring | K1_pump_guard | TOP_ZONE_filter | FAST_DUMP | trailing_stop({TRAIL_DISTANCE_A:.0%}A/{TRAIL_DISTANCE_B:.0%}B)")
-    log(f"v5.4: time_decay_SL {TIME_DECAY_SL} | 3-check_protection | cooldown_dedup(30min) | session_pause({SESSION_CONSEC_LOSS_MAX}loss/{SESSION_CONSEC_PAUSE}s) | liq_emergency($5k)")
-    log(f"v5.4: position_scoring | breakthrough_logic | hot_momentum_tier_D")
-    log(f"Existing positions: {len(positions)}")
-    log("=" * 60)
+    # 3. Load state
+    load_positions()
+    load_acted()
+    load_session()
+    load_trades()
 
-    # 启动冷却期：前 180 秒只监控持仓，不开新仓（防止重启时立即买入）
-    startup_time = time.time()
-    STARTUP_COOLDOWN = 180  # 3 分钟
+    with pos_lock:
+        n_pos = len(state["positions"])
+    feed(f"  Loaded: {n_pos} positions, {len(acted)} acted, {len(state['trades'])} trades")
 
-    while True:
-        now = time.time()
-        reset_daily_if_needed(daily_state)
+    # 4. Position takeover
+    takeover_existing_positions()
 
-        # 余额检查（每 60s）
-        if now - last_balance_check > 60:
-            usdc = get_usdc_balance()
-            log(
-                f"USDC: ${usdc:.2f} | Daily PnL: ${daily_state['realized_pnl']:+.2f} | "
-                f"Safety: ${get_safety_line()} | Positions: {len(positions)}"
-            )
-            last_balance_check = now
+    # 5. Print startup banner
+    night = is_night()
+    feed(f"Mode: {'PAPER' if config.PAPER_TRADE else 'LIVE'} | "
+         f"Night: {night} | PAUSED: {config.PAUSED}")
+    feed(f"Tier A: ${config.TIER_A_SIZE_DAY}(day)/${config.TIER_A_SIZE_NIGHT}(night) | "
+         f"MC ${config.TIER_A_MC_MIN:,}-${config.TIER_A_MC_MAX:,}")
+    feed(f"Tier B: ${config.TIER_B_SIZE_DAY}(day)/${config.TIER_B_SIZE_NIGHT}(night) | "
+         f"stage={config.TIER_B_STAGE} | MC ${config.TIER_B_MC_MIN:,}-${config.TIER_B_MC_MAX:,}")
+    feed(f"Tier D: base=${config.TIER_D_SIZE_BASE} dynamic | "
+         f"MC ${config.TIER_D_MC_MIN:,}-${config.TIER_D_MC_MAX:,} | score>={config.TIER_D_SCORE_THRESHOLD}")
+    feed(f"Risk: MAX_POS={config.MAX_POSITIONS} | DAILY_LOSS=${config.DAILY_LOSS_LIMIT} | "
+         f"CONSEC_PAUSE={config.MAX_CONSEC_LOSS}x/{config.PAUSE_CONSEC_SEC}s")
+    feed(f"Scan intervals: SM={config.SM_REFRESH_SEC}s B={config.GRADUATED_REFRESH_SEC}s "
+         f"D={config.HOT_REFRESH_SEC}s MON={config.MONITOR_SEC}s")
+    feed(f"Existing positions: {n_pos}")
+    print("=" * 60)
 
-        # 持仓检查（每 1s — 加速止损反应）
-        if now - last_pos_check > 1:
-            check_positions(positions, daily_state)
-            last_pos_check = now
+    # 6. Start dashboard
+    start_dashboard()
 
-        # 安全线熔断
-        if usdc < get_safety_line():
-            log(f"SAFETY LINE: ${usdc:.2f} < ${get_safety_line()} — no new entries")
-            time.sleep(10)
-            continue
+    # 7. Start monitor thread
+    monitor_thread = threading.Thread(target=monitor_positions, daemon=True)
+    monitor_thread.start()
 
-        # 每日亏损熔断 — 触发后需重启才能恢复（不自动日重置）
-        if daily_state.get("halted") or daily_state["realized_pnl"] < -DAILY_LOSS_LIMIT:
-            if not daily_state.get("halted"):
-                daily_state["halted"] = True
-                log(f"🚨 DAILY LOSS LIMIT HIT: ${daily_state['realized_pnl']:.2f} — 需重启脚本才能恢复交易")
-            log(f"HALTED: 日亏损熔断，请重启脚本恢复 | PnL=${daily_state['realized_pnl']:.2f}")
-            time.sleep(60)
-            continue
+    # 8. Signal handlers
+    def shutdown_handler(signum, frame):
+        global _shutdown
+        _shutdown = True
+        feed(f"Received signal {signum}, shutting down...")
+        with pos_lock:
+            n = len(state["positions"])
+            save_positions()
+        if n > 0:
+            feed(f"  WARNING: {n} position(s) still open on-chain!")
+            feed(f"  Positions saved to {config.POSITIONS_FILE}")
+        else:
+            feed("  No open positions.")
+        save_session()
+        feed("  Shutdown complete.")
+        sys.exit(0)
 
-        # 启动冷却期：前 3 分钟只监控，不开新仓
-        if now - startup_time < STARTUP_COOLDOWN:
-            elapsed = now - startup_time
-            if int(elapsed) % 30 == 0:  # 每 30 秒提示一次
-                log(f"  STARTUP_COOLDOWN: {STARTUP_COOLDOWN - elapsed:.0f}s remaining, monitoring only")
-            time.sleep(2)
-            continue
+    signal.signal(signal.SIGINT, shutdown_handler)
+    signal.signal(signal.SIGTERM, shutdown_handler)
 
-        # Hot-tokens 缓存刷新（每 HOT_REFRESH 秒）
-        if now - hot_cache_ts > HOT_REFRESH:
-            hot_cache = get_hot_tokens()
-            hot_cache_ts = now
-
-        # ── Tier A：SM tracker（每 SM_REFRESH=30s）─────────────────────────
-        if now - last_sm_check > SM_REFRESH:
-            signals = fetch_sm_signals()
-            log(f"Tier A SM signals: {len(signals)}")
-            for addr, strength, n_wallets, mc, sym in signals:
-                if is_acted(acted, addr) or addr in positions:
-                    continue
-                # v5.1: cooldown dedup
-                if time.time() < cooldown_until.get(addr, 0):
-                    remaining = cooldown_until[addr] - time.time()
-                    log(f"  COOLDOWN: {sym} skip {remaining:.0f}s left")
-                    continue
-                ok, size = entry_guard(positions, daily_state, usdc, "A", addr=addr)
-                if not ok:
-                    log(f"  SKIP Tier A {sym}: {size}")
-                    continue
-                # STRONG: 直接买; NORMAL: 需要 hot-tokens 确认
-                if strength == "NORMAL":
-                    inflow = get_hot_inflow(hot_cache, addr)
-                    if inflow <= 500:
-                        log(f"  SKIP Tier A NORMAL {sym}: not in hot-50 (inflow=${inflow:.0f} <= 500)")
-                        continue
-                # v5.1: Confidence scoring
-                confidence = min(90, n_wallets * 30)
-                inflow_val = get_hot_inflow(hot_cache, addr)
-                if inflow_val > 500:
-                    confidence += 20
-                confidence = min(100, confidence)
-                if confidence < 60:
-                    log(f"  SKIP Tier A {sym}: confidence={confidence} < 60")
-                    continue
-                sec_ok, sec_reason = security_check(addr)
-                if not sec_ok:
-                    log(f"  REJECT Tier A {sym} security: {sec_reason}")
-                    acted[addr] = time.time()
-                    save_acted(acted)
-                    continue
-                # v5.1: K1 pump guard
-                if check_k1_pump(addr, sym):
-                    log(f"  SKIP Tier A {sym}: K1 pump guard")
-                    continue
-                # v5.1: TOP_ZONE filter
-                cur_price_pre = get_token_price(addr)
-                if cur_price_pre and check_top_zone(addr, cur_price_pre, sym):
-                    log(f"  SKIP Tier A {sym}: TOP_ZONE filter")
-                    continue
-                log(f"ENTER TIER_A {sym} ${size} | MC=${mc:.0f} | {strength} {n_wallets}w | conf={confidence}")
-                ok_swap, _ = execute_swap(USDC_ADDR, addr, size)
-                if ok_swap:
-                    entry_price = 0
-                    for _try in range(3):
-                        entry_price = get_token_price(addr)
-                        if entry_price > 0:
-                            break
-                        time.sleep(2)
-                    if entry_price <= 0:
-                        log(f"  WARN: {sym} price=0 after 3 retries, storing amt_tokens=0 (will retry in check_positions)")
-                        amt_tokens = 0
-                    else:
-                        amt_tokens = size / entry_price
-                    positions[addr] = {
-                        "sym":           sym,
-                        "amount_usd":    size,
-                        "amount_tokens": amt_tokens,    # 0 if price unavailable
-                        "entry_price":   entry_price,   # may be 0 — check_positions will log and skip
-                        "entry_time":    time.time(),
-                        "tier":          "TIER_A",
-                        "tp1_done":      False,
-                        "tp2_done":      False,
-                        "tp3_done":      False,
-                        "holders_at_entry": 0,
-                        "peak_price":    entry_price,
-                        "last_liq_check": 0,
-                        "zero_price_count": 0,
-                        "confidence":    confidence,
-                    }
-                    acted[addr] = time.time()
-                    save_acted(acted)
-                    usdc -= size
-                    log(f"  ENTERED Tier A {sym} ${size} | USDC left: ${usdc:.1f}")
-                else:
-                    acted[addr] = time.time()
-                    save_acted(acted)
-            last_sm_check = now
-
-        # ── Tier B：MIGRATING（每 MIGRATING_REFRESH=60s）──────────────────
-        if now - last_migrating_check > MIGRATING_REFRESH:
-            candidates = fetch_migrating_tokens()
-            log(f"Tier B MIGRATING candidates: {len(candidates)}")
-            for t in candidates:
-                addr = t.get("tokenAddress", "")
-                sym  = t.get("_sym", "?")
-                mc   = t.get("_mc", 0)
-                bonding = sf(t.get("bondingPercent", 0))
-                if not addr:
-                    continue
-                if is_acted(acted, addr) or addr in positions:
-                    continue
-                # v5.1: cooldown dedup
-                if time.time() < cooldown_until.get(addr, 0):
-                    remaining = cooldown_until[addr] - time.time()
-                    log(f"  COOLDOWN: {sym} skip {remaining:.0f}s left")
-                    continue
-                ok, size = entry_guard(positions, daily_state, usdc, "B", addr=addr)
-                if not ok:
-                    log(f"  SKIP Tier B {sym}: {size}")
-                    continue
-                sec_ok, sec_reason = security_check(addr)
-                if not sec_ok:
-                    log(f"  REJECT Tier B {sym} security: {sec_reason}")
-                    acted[addr] = time.time()
-                    save_acted(acted)
-                    continue
-                # v5.2: K1 pump guard for Tier B too
-                if check_k1_pump(addr, sym):
-                    log(f"  SKIP Tier B {sym}: K1 pump guard")
-                    continue
-                log(f"ENTER TIER_B {sym} ${size} | MC=${mc:.0f} | bonding={bonding:.1f}%")
-                ok_swap, _ = execute_swap(USDC_ADDR, addr, size)
-                if ok_swap:
-                    entry_price = 0
-                    for _try in range(3):
-                        entry_price = get_token_price(addr)
-                        if entry_price > 0:
-                            break
-                        time.sleep(2)
-                    if entry_price <= 0:
-                        log(f"  WARN: {sym} price=0 after 3 retries, storing amt_tokens=0 (will retry in check_positions)")
-                        amt_tokens = 0
-                    else:
-                        amt_tokens = size / entry_price
-                    positions[addr] = {
-                        "sym":           sym,
-                        "amount_usd":    size,
-                        "amount_tokens": amt_tokens,    # 0 if price unavailable
-                        "entry_price":   entry_price,   # may be 0 — check_positions will log and skip
-                        "entry_time":    time.time(),
-                        "tier":          "TIER_B",
-                        "tp1_done":      False,
-                        "tp2_done":      False,
-                        "holders_at_entry": 0,
-                        "bonding_at_entry": bonding,
-                        "peak_price":    entry_price,
-                        "last_liq_check": 0,
-                        "zero_price_count": 0,
-                    }
-                    acted[addr] = time.time()
-                    save_acted(acted)
-                    usdc -= size
-                    log(f"  ENTERED Tier B {sym} ${size} | USDC left: ${usdc:.1f}")
-                    break  # 每轮最多买入 1 个 Tier B，避免一次性连买
-                else:
-                    acted[addr] = time.time()
-                    save_acted(acted)
-            last_migrating_check = now
-
-        # ── Tier C：EARLY MIGRATING（每 NEW_REFRESH=15s，夜间禁止）────────────
-        if not is_night_time() and now - last_new_check > NEW_REFRESH:
-            candidates_c = fetch_early_migrating_tokens()
-            log(f"Tier C EARLY_MIGRATING candidates: {len(candidates_c)}")
-            for t in candidates_c:
-                addr    = t.get("tokenAddress", "")
-                sym     = t.get("_sym", "?")
-                mc      = t.get("_mc", 0)
-                bonding = sf(t.get("bondingPercent", 0))
-                holders = int(sf(t.get("tags", {}).get("totalHolders", 0)))
-                if not addr:
-                    continue
-                if is_acted(acted, addr) or addr in positions:
-                    continue
-                # v5.1: cooldown dedup
-                if time.time() < cooldown_until.get(addr, 0):
-                    remaining = cooldown_until[addr] - time.time()
-                    log(f"  COOLDOWN: {sym} skip {remaining:.0f}s left")
-                    continue
-                # Tier C 连续亏损冷却检查
-                if time.time() < daily_state["tier_c_pause_until"]:
-                    remaining = daily_state["tier_c_pause_until"] - time.time()
-                    log(f"  SKIP Tier C: cooldown {remaining/60:.0f}min left")
-                    break
-                ok, size = entry_guard(positions, daily_state, usdc, "C", addr=addr)
-                if not ok:
-                    log(f"  SKIP Tier C {sym}: {size}")
-                    continue
-                sec_ok, sec_reason = security_check(addr)
-                if not sec_ok:
-                    log(f"  REJECT Tier C {sym} security: {sec_reason}")
-                    acted[addr] = time.time()
-                    save_acted(acted)
-                    continue
-                log(f"ENTER TIER_C {sym} ${size} | MC=${mc:.0f} | bonding={bonding:.1f}% | holders={holders}")
-                ok_swap, _ = execute_swap(USDC_ADDR, addr, size)
-                if ok_swap:
-                    entry_price = 0
-                    for _try in range(3):
-                        entry_price = get_token_price(addr)
-                        if entry_price > 0:
-                            break
-                        time.sleep(2)
-                    if entry_price <= 0:
-                        log(f"  WARN: {sym} price=0 after 3 retries, storing amt_tokens=0 (will retry in check_positions)")
-                        amt_tokens = 0
-                    else:
-                        amt_tokens = size / entry_price
-                    positions[addr] = {
-                        "sym":             sym,
-                        "amount_usd":      size,
-                        "amount_tokens":   amt_tokens,    # 0 if price unavailable
-                        "entry_price":     entry_price,   # may be 0 — check_positions will log and skip
-                        "entry_time":      time.time(),
-                        "tier":            "TIER_C",
-                        "tp1_done":        False,
-                        "holders_at_entry": holders,
-                        "peak_price":      entry_price,
-                        "last_liq_check":  0,
-                        "zero_price_count": 0,
-                    }
-                    acted[addr] = time.time()
-                    save_acted(acted)
-                    usdc -= size
-                    daily_state["tier_c_count"] = daily_state.get("tier_c_count", 0) + 1
-                    log(f"  ENTERED Tier C {sym} ${size} | USDC left: ${usdc:.1f}")
-                    break  # 每轮最多买入 1 个 Tier C，避免一次性连买
-                else:
-                    acted[addr] = time.time()
-                    save_acted(acted)
-            last_new_check = now
-
-        # -- Tier D: HOT MOMENTUM (every 60s) --
-        if now - last_hot_momentum_check > MIGRATING_REFRESH:
-            hot_momentum = fetch_hot_momentum_tokens()
-            log(f"Tier D HOT_MOMENTUM candidates: {len(hot_momentum)}")
-            for t in hot_momentum:
-                addr = t.get("tokenContractAddress", "")
-                sym = t.get("tokenSymbol", "?")
-                if not addr:
-                    continue
-                if is_acted(acted, addr) or addr in positions:
-                    continue
-                if time.time() < cooldown_until.get(addr, 0):
-                    remaining = cooldown_until[addr] - time.time()
-                    log(f"  COOLDOWN: {sym} skip {remaining:.0f}s left")
-                    continue
-                # Calculate position score with unique_traders
-                holders = int(sf(t.get("holders", 0)))
-                buy_tx = int(sf(t.get("txsBuy", 0)))
-                sell_tx = int(sf(t.get("txsSell", 0)))
-                unique_traders = int(sf(t.get("uniqueTraders", 0)))
-                change_pct = sf(t.get("change", 0))
-                score = calculate_position_score(holders, 0, buy_tx, sell_tx, unique_traders, change_pct)
-                if score < 45:
-                    log(f"  SKIP Tier D {sym}: score={score} < 45 (need higher quality)")
-                    continue
-                ok, size = entry_guard(positions, daily_state, usdc, "D", addr=addr, score=score)
-                if not ok:
-                    log(f"  SKIP Tier D {sym}: {size}")
-                    continue
-                sec_ok, sec_reason = security_check(addr)
-                if not sec_ok:
-                    log(f"  REJECT Tier D {sym} security: {sec_reason}")
-                    acted[addr] = time.time()
-                    save_acted(acted)
-                    continue
-                mc = sf(t.get("marketCap", 0))
-                log(f"ENTER TIER_D {sym} ${size} | MC=${mc:.0f} | holders={holders} | score={score}")
-                ok_swap, _ = execute_swap(USDC_ADDR, addr, size)
-                if ok_swap:
-                    entry_price = 0
-                    for _try in range(3):
-                        entry_price = get_token_price(addr)
-                        if entry_price > 0:
-                            break
-                        time.sleep(2)
-                    if entry_price <= 0:
-                        log(f"  WARN: {sym} price=0 after 3 retries")
-                        amt_tokens = 0
-                    else:
-                        amt_tokens = size / entry_price
-                    positions[addr] = {
-                        "sym": sym,
-                        "amount_usd": size,
-                        "amount_tokens": amt_tokens,
-                        "entry_price": entry_price,
-                        "entry_time": time.time(),
-                        "tier": "TIER_D",
-                        "tp1_done": False,
-                        "tp2_done": False,
-                        "holders_at_entry": holders,
-                        "peak_price": entry_price,
-                        "last_liq_check": 0,
-                        "zero_price_count": 0,
-                        "score": score,
-                    }
-                    acted[addr] = time.time()
-                    save_acted(acted)
-                    usdc -= size
-                    log(f"  ENTERED Tier D {sym} ${size} | USDC left: ${usdc:.1f}")
-                    break  # 1 per cycle limit
-                else:
-                    acted[addr] = time.time()
-                    save_acted(acted)
-            last_hot_momentum_check = now
-
-        time.sleep(2)
+    # 9. Run scanner loop (blocks)
+    scanner_loop()
 
 
 if __name__ == "__main__":
