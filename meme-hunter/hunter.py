@@ -54,7 +54,7 @@ SM_MAX_LIQ   = 200000
 SM_WINDOW    = 600   # 10 分钟内多钱包信号视为强信号
 
 # Tier B 过滤（MIGRATING 毕业伏击）
-MIN_BONDING    = 70
+MIN_BONDING    = 90
 MAX_BONDING    = 97
 MAX_INSIDERS   = 30
 MAX_TOP10_B    = 40
@@ -1693,8 +1693,8 @@ def main():
                 unique_traders = int(sf(t.get("uniqueTraders", 0)))
                 change_pct = sf(t.get("change", 0))
                 score = calculate_position_score(holders, 0, buy_tx, sell_tx, unique_traders, change_pct)
-                if score < 50:
-                    log(f"  SKIP Tier D {sym}: score={score} < 50 (need higher quality)")
+                if score < 45:
+                    log(f"  SKIP Tier D {sym}: score={score} < 45 (need higher quality)")
                     continue
                 ok, size = entry_guard(positions, daily_state, usdc, "D", addr=addr, score=score)
                 if not ok:
