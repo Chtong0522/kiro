@@ -176,8 +176,9 @@ SL_RULES = {
 # ── Emergency Exit / 紧急退出 ─────────────────────────────────────────────
 # 所有层通用 | Universal for all tiers
 HE1_PCT            = -0.50     # 暴跌 -50% 紧急退出 | -50% crash emergency exit
-FAST_DUMP_PCT      = -0.15     # 10秒内跌 -15% 闪崩退出 | -15% in 10s flash dump exit
-FAST_DUMP_SEC      = 10        # 闪崩检测窗口 (秒) | Flash dump detection window (seconds)
+FAST_DUMP_PCT      = -0.15     # 从峰值跌 -15% 闪崩退出 | -15% from peak flash dump exit
+FAST_DUMP_SEC      = 10        # 旧参数 (兼容) | Legacy param (compat)
+FAST_DUMP_WINDOW   = 60        # 闪崩检测窗口: 峰值在60秒内且跌>=15%触发 | If peak was within 60s and dropped 15%+, trigger
 LIQ_EMERGENCY      = 5_000     # 流动性<$5K紧急退出 | Liquidity < $5K emergency exit
 
 # ── Session Risk Control / 会话风控 ───────────────────────────────────────

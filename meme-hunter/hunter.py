@@ -57,6 +57,7 @@ trades_lock = threading.Lock()
 cooldown_map = {}       # {addr: expire_timestamp}
 _selling = set()        # prevent concurrent sells of the same token
 _wallet_addr = ""       # cached wallet address
+_risk_check_semaphore = threading.Semaphore(3)  # cap concurrent post_trade_flags threads
 
 state = {
     "positions": {},
@@ -717,6 +718,24 @@ def process_tier_b():
         if aped < config.TIER_B_APED_MIN:
             continue
 
+        # Age check: skip tokens that graduated too long ago
+        # Check migratedTime / createdTime / graduatedAt field if available
+        now_sec = time.time()
+        max_age_sec = config.TIER_B_MAX_AGE_MIN * 60
+        migrated_ts = safe_float(
+            tok.get("migratedTime", 0) or tok.get("graduatedAt", 0)
+            or tok.get("createdTime", 0) or tok.get("migrationTime", 0)
+        )
+        if migrated_ts > 0:
+            # Handle both seconds and milliseconds timestamps
+            if migrated_ts > 1e12:
+                migrated_ts = migrated_ts / 1000.0
+            age_sec = now_sec - migrated_ts
+            if age_sec > max_age_sec:
+                continue
+        # Note: if no timestamp field is available from the API response,
+        # the age check is skipped (cannot determine graduation time).
+
         filtered.append({"addr": addr, "mc": mc, "holders": holders,
                          "symbol": tok.get("symbol", tok.get("tokenSymbol", "?"))})
 
@@ -1074,8 +1093,16 @@ def _monitor_cycle():
                     zc = state["positions"][addr].get("zero_count", 0) + 1
                     state["positions"][addr]["zero_count"] = zc
                     if zc >= 3:
-                        # Still do not delete - just skip monitoring
-                        pass
+                        # Ghost cleanup: if zero_count >= 30 (30+ consecutive seconds
+                        # of zero price) AND position age > 24 hours, auto-remove
+                        # to prevent permanently blocked slots.
+                        age_sec = now - safe_float(pos.get("opened_at_ts", now))
+                        if zc >= 30 and age_sec > 86400:
+                            state["positions"].pop(addr, None)
+                            save_positions()
+                            feed(f"  GHOST_CLEANUP {pos.get('symbol', addr[:8])}: "
+                                 f"zero_count={zc}, age={age_sec/3600:.1f}h")
+                        # Otherwise still do not delete - just skip monitoring
             continue
         else:
             # Reset zero count on valid price
@@ -1114,9 +1141,10 @@ def _monitor_cycle():
         if pnl_pct < 0:
             drop_from_peak = (peak_price - cur_price) / peak_price if peak_price > 0 else 0
             if drop_from_peak >= abs(config.FAST_DUMP_PCT):
-                # Check if drop happened recently (within FAST_DUMP_SEC)
+                # Check if price was at/near peak within FAST_DUMP_WINDOW seconds
                 last_peak_ts = safe_float(pos.get("last_peak_ts", 0))
-                if last_peak_ts > 0 and (now - last_peak_ts) <= config.FAST_DUMP_SEC:
+                fast_dump_window = getattr(config, "FAST_DUMP_WINDOW", 60)
+                if last_peak_ts > 0 and (now - last_peak_ts) <= fast_dump_window:
                     _exit_position(addr, pos, 1.0, "FAST_DUMP", pnl_pct)
                     continue
 
@@ -1176,6 +1204,11 @@ def _monitor_cycle():
                 continue
 
         # ── Tiered Take Profit ──
+        # If force_exit_at_tp is set (from EXIT_NEXT_TP risk flag), exit immediately at any profit
+        if pos.get("force_exit_at_tp") and pnl_pct >= 0:
+            _exit_position(addr, pos, 1.0, "FORCE_EXIT_AT_TP", pnl_pct)
+            continue
+
         if tp_tier_done == 0:
             tp1_pct = safe_float(tp_rules.get("tp1_pct", 0.15))
             tp1_sell = safe_float(tp_rules.get("tp1_sell", 0.60))
@@ -1212,6 +1245,8 @@ def _monitor_cycle():
         _esp = safe_float(pos.get("entry_sniper_pct", 0))
 
         def _run_post_flags(_a=addr, _s=_sym, _l=_eliq, _t=_et10, _sp=_esp):
+            if not _risk_check_semaphore.acquire(blocking=False):
+                return  # skip this cycle if too many concurrent checks
             try:
                 flags = post_trade_flags(_a, _s, entry_liquidity_usd=_l,
                                          entry_top10=_t, entry_sniper_pct=_sp)
@@ -1220,8 +1255,19 @@ def _monitor_cycle():
                     if flag.startswith("EXIT_NOW"):
                         _exit_position(_a, None, 1.0, f"RISK_EXIT", 0)
                         break
+                    elif flag.startswith("EXIT_NEXT_TP"):
+                        # Mark position so next TP fires at current price
+                        with pos_lock:
+                            if _a in state["positions"]:
+                                state["positions"][_a]["force_exit_at_tp"] = True
+                    elif flag.startswith("REDUCE_POSITION"):
+                        # Intentionally not acted upon: partial sells are complex
+                        # and the reference skill also skips implementation.
+                        pass
             except Exception:
                 pass
+            finally:
+                _risk_check_semaphore.release()
 
         threading.Thread(target=_run_post_flags, daemon=True).start()
 
@@ -1316,7 +1362,12 @@ def can_enter():
 
 
 def record_loss(pnl_usd):
-    """Record loss and update session risk control."""
+    """Record loss and update session risk control.
+
+    Note: cumulative_loss_usd tracks gross losses intentionally (never reduced
+    by wins). This is conservative by design -- prevents runaway loss spirals
+    where alternating wins/losses mask a trend of increasing risk exposure.
+    """
     with state_lock:
         session_risk["consecutive_losses"] += 1
         session_risk["cumulative_loss_usd"] += abs(pnl_usd)
@@ -1663,9 +1714,9 @@ def start_dashboard():
         return
     try:
         HTTPServer.allow_reuse_address = True
-        server = HTTPServer(("0.0.0.0", config.DASHBOARD_PORT), DashboardHandler)
+        server = HTTPServer(("127.0.0.1", config.DASHBOARD_PORT), DashboardHandler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
-        feed(f"Dashboard: http://localhost:{config.DASHBOARD_PORT}")
+        feed(f"Dashboard: http://127.0.0.1:{config.DASHBOARD_PORT}")
     except Exception as e:
         feed(f"Dashboard failed to start: {e}")
 
