@@ -854,7 +854,7 @@ def entry_guard(positions, daily_state, usdc, tier, addr=None, score=None):
     return True, size
 
 
-def calculate_position_score(holders, aped, buy_tx, sell_tx, unique_traders=0):
+def calculate_position_score(holders, aped, buy_tx, sell_tx, unique_traders=0, change_pct=0):
     """Calculate a score 0-100 to determine position size."""
     score = 0
     if holders >= 200: score += 30
@@ -873,6 +873,10 @@ def calculate_position_score(holders, aped, buy_tx, sell_tx, unique_traders=0):
     if unique_traders >= 500: score += 15
     elif unique_traders >= 200: score += 10
     elif unique_traders >= 100: score += 5
+    # 涨幅加分（Tier D 专用）
+    if change_pct >= 20: score += 15
+    elif change_pct >= 10: score += 10
+    elif change_pct >= 5: score += 5
     return min(100, score)
 
 
@@ -1687,7 +1691,11 @@ def main():
                 buy_tx = int(sf(t.get("txsBuy", 0)))
                 sell_tx = int(sf(t.get("txsSell", 0)))
                 unique_traders = int(sf(t.get("uniqueTraders", 0)))
-                score = calculate_position_score(holders, 0, buy_tx, sell_tx, unique_traders)
+                change_pct = sf(t.get("change", 0))
+                score = calculate_position_score(holders, 0, buy_tx, sell_tx, unique_traders, change_pct)
+                if score < 50:
+                    log(f"  SKIP Tier D {sym}: score={score} < 50 (need higher quality)")
+                    continue
                 ok, size = entry_guard(positions, daily_state, usdc, "D", addr=addr, score=score)
                 if not ok:
                     log(f"  SKIP Tier D {sym}: {size}")
