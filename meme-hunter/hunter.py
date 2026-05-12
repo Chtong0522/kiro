@@ -59,7 +59,7 @@ MAX_BONDING    = 97
 MAX_INSIDERS   = 30
 MAX_TOP10_B    = 40
 TIER_B_MIN_MC      = 12000   # MIGRATING tokens MC range is $12k-$29k
-TIER_B_MIN_HOLDERS = 100     # 至少 100 持币地址，低于此风险过大
+TIER_B_MIN_HOLDERS = 50      # 降低门槛，配合 breakthrough 逻辑
 TIER_B_MIN_APED    = 1       # Reduced from 2
 
 # Tier C 过滤（EARLY MIGRATING 早期毕业预埋）— 30-65% bonding 区间
@@ -67,7 +67,7 @@ MIN_BONDING_C        = 30     # 早期毕业前段
 MAX_BONDING_C        = 65     # 还没到冲刺阶段
 TIER_C_MIN_MC        = 5000   # MC 至少 $5000
 TIER_C_MAX_MC        = 15000  # MC 最多 $15000（小市值早期）
-TIER_C_MIN_HOLDERS   = 100    # 至少 100 个持币地址，低于此不买
+TIER_C_MIN_HOLDERS   = 80     # 降低至 80，配合动态仓位评分
 TIER_C_MIN_BUY_TX    = 5      # 至少 5 笔买单
 TIER_C_TIMEOUT_MIN   = 30     # 超时 30 分钟（early MIGRATING 需要时间）
 
@@ -76,6 +76,16 @@ HOT_REFRESH       = 300
 SM_REFRESH        = 30
 MIGRATING_REFRESH = 60
 NEW_REFRESH       = 15
+
+# Tier D 过滤（HOT MOMENTUM 热门动量）
+TIER_D_SIZE         = 5
+TIER_D_NIGHT        = 3
+TIER_D_MIN_HOLDERS  = 500
+TIER_D_MIN_MC       = 100000
+TIER_D_MAX_MC       = 10000000
+TIER_D_MIN_LIQ      = 30000
+TIER_D_MAX_TOP10    = 35
+TIER_D_MIN_TRADERS  = 100
 
 # ─── v5.1 策略常量 ────────────────────────────────────────────────────────────
 # 追踪止损：TP1 后从峰值回撤触发清仓
@@ -458,6 +468,59 @@ def get_hot_inflow(hot_cache, addr):
     return hot_cache.get(addr, {}).get("inflow", 0)
 
 
+def fetch_hot_momentum_tokens():
+    """
+    Fetch hot tokens with momentum filters for Tier D.
+    Uses onchainos token hot-tokens API with ranking-type 4.
+    """
+    out = run("onchainos token hot-tokens --chain solana --ranking-type 4 --limit 20", timeout=25)
+    d = jparse(out)
+    items = d.get("data", [])
+    if isinstance(items, dict):
+        items = items.get("list", [])
+
+    candidates = []
+    for t in (items or []):
+        addr = t.get("tokenContractAddress", "")
+        if not addr:
+            continue
+        holders = int(sf(t.get("holders", 0)))
+        mc = sf(t.get("marketCap", 0))
+        liq = sf(t.get("liquidity", 0))
+        top10 = sf(t.get("top10HoldPercent", 100))
+        risk = t.get("riskLevelControl", "")
+        inflow = sf(t.get("inflowUsd", 0))
+        change = sf(t.get("change", 0))
+        unique_traders = int(sf(t.get("uniqueTraders", 0)))
+        buy_tx = int(sf(t.get("txsBuy", 0)))
+        sell_tx = int(sf(t.get("txsSell", 0)))
+
+        # Filter conditions
+        if holders < TIER_D_MIN_HOLDERS:
+            continue
+        if not (TIER_D_MIN_MC <= mc <= TIER_D_MAX_MC):
+            continue
+        if liq < TIER_D_MIN_LIQ:
+            continue
+        if top10 >= TIER_D_MAX_TOP10:
+            continue
+        if risk != "1":
+            continue
+        if inflow <= 0:
+            continue
+        if change <= 5:
+            continue
+        if unique_traders < TIER_D_MIN_TRADERS:
+            continue
+        if buy_tx <= sell_tx:
+            continue
+
+        t["_filtered"] = True
+        candidates.append(t)
+
+    return candidates
+
+
 # ─── v5.1：K1 pump guard + TOP_ZONE filter ───────────────────────────────────
 
 def check_k1_pump(addr, sym="?"):
@@ -566,13 +629,23 @@ def fetch_migrating_tokens():
             continue
         if top10 >= MAX_TOP10_B:
             continue
+        holders = int(sf(t.get("tags", {}).get("totalHolders", 0)))
+
+        # Breakthrough logic: high buy pressure + enough holders bypasses other filters
+        if buy_tx >= 100 and holders >= 80:
+            log(f"  TIER_B_BREAKTHROUGH {sym}: buy_tx={buy_tx} holders={holders} — bypassing filters")
+            t["tokenAddress"] = addr
+            t["_sym"] = sym
+            t["_mc"] = mc
+            candidates.append(t)
+            continue
+
         if aped < TIER_B_MIN_APED:
             log(f"  TIER_B_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
             continue
         if mc < TIER_B_MIN_MC:
             log(f"  TIER_B_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
             continue
-        holders = int(sf(t.get("tags", {}).get("totalHolders", 0)))
         if holders < TIER_B_MIN_HOLDERS:
             log(f"  TIER_B_REJECT {sym}: MC=${mc:.0f} bonding={bonding:.1f}% aped={aped} holders={holders} buy={buy_tx} sell={sell_tx}")
             continue
@@ -731,7 +804,7 @@ def check_sm_exiting(addr):
 
 # ─── 入场守卫 ─────────────────────────────────────────────────────────────────
 
-def entry_guard(positions, daily_state, usdc, tier, addr=None):
+def entry_guard(positions, daily_state, usdc, tier, addr=None, score=None):
     """
     所有入场前检查，返回 (True, size) 或 (False, reason)
     """
@@ -765,9 +838,11 @@ def entry_guard(positions, daily_state, usdc, tier, addr=None):
         if time.time() < daily_state["tier_c_pause_until"]:
             remaining = daily_state["tier_c_pause_until"] - time.time()
             return False, f"tier_c_cooldown {remaining/60:.0f}min left"
-        size = TIER_C_SIZE
+        size = score_to_size(score, "C", night) if score is not None else TIER_C_SIZE
+    elif "D" in tier_upper:
+        size = score_to_size(score, "D", night) if score is not None else (TIER_D_NIGHT if night else TIER_D_SIZE)
     elif "B" in tier_upper:
-        size = TIER_B_NIGHT if night else TIER_B_SIZE
+        size = score_to_size(score, "B", night) if score is not None else (TIER_B_NIGHT if night else TIER_B_SIZE)
     elif "A" in tier_upper or "takeover" in tier_upper.lower():
         size = TIER_A_NIGHT if night else TIER_A_SIZE
     else:
@@ -777,6 +852,49 @@ def entry_guard(positions, daily_state, usdc, tier, addr=None):
         return False, f"insufficient_usdc ${usdc:.1f}<${size}"
 
     return True, size
+
+
+def calculate_position_score(holders, aped, buy_tx, sell_tx, unique_traders=0):
+    """Calculate a score 0-100 to determine position size."""
+    score = 0
+    if holders >= 200: score += 30
+    elif holders >= 100: score += 20
+    elif holders >= 50: score += 10
+    if aped >= 5: score += 30
+    elif aped >= 3: score += 20
+    elif aped >= 1: score += 10
+    if sell_tx > 0:
+        ratio = buy_tx / sell_tx
+        if ratio >= 2.0: score += 25
+        elif ratio >= 1.5: score += 15
+        elif ratio >= 1.2: score += 10
+    elif buy_tx >= 10:
+        score += 20
+    if unique_traders >= 500: score += 15
+    elif unique_traders >= 200: score += 10
+    elif unique_traders >= 100: score += 5
+    return min(100, score)
+
+
+def score_to_size(score, tier, is_night):
+    """Convert score to position size in USD."""
+    if "D" in tier.upper():
+        base = TIER_D_NIGHT if is_night else TIER_D_SIZE
+        if score >= 70: return base + 3
+        if score >= 55: return base + 1
+        return base
+    elif "B" in tier.upper():
+        base = TIER_B_NIGHT if is_night else TIER_B_SIZE
+        if score >= 70: return base + 3
+        if score >= 55: return base + 1
+        return max(2, base - 1)
+    elif "C" in tier.upper():
+        if score >= 70: return 4
+        if score >= 55: return 3
+        return 2
+    else:  # Tier A
+        base = TIER_A_NIGHT if is_night else TIER_A_SIZE
+        return base
 
 
 # ─── 持仓监控与 TP/SL ────────────────────────────────────────────────────────
@@ -1159,6 +1277,70 @@ def check_positions(positions, daily_state):
                     del positions[addr]
                 continue
 
+        elif "D" in tier:
+            # TP1: +15% -> sell 60%
+            if pnl_pct >= 0.15 and not pos.get("tp1_done"):
+                sell_amt = amt_tokens * 0.60
+                ok, _ = sell_token(addr, sym, sell_amt, f"Tier_D_TP1 +{pnl_pct:.0%}")
+                if ok:
+                    sold_usd = sell_amt * cur
+                    realized = sold_usd - amt_usd * 0.60
+                    add_realized_pnl(daily_state, realized)
+                    _record_sell_outcome(realized, addr)
+                    pos["tp1_done"] = True
+                    pos["amount_tokens"] = amt_tokens * 0.40
+                    pos["amount_usd"] = amt_usd * 0.40
+                    log(f"  Tier D TP1 done, remaining {pos['amount_tokens']:.0f}t")
+                continue
+
+            # Trailing Stop after TP1 (8% drawdown)
+            if pos.get("tp1_done"):
+                if peak > 0 and (peak - cur) / peak >= 0.08 and cur > entry:
+                    log(f"  TrailingStop TIER_D {sym}: peak=${peak:.6f} cur=${cur:.6f} drawdown={(peak-cur)/peak:.1%}")
+                    ok, _ = sell_token(addr, sym, pos["amount_tokens"], "TrailingStop_D")
+                    if ok:
+                        realized = pos["amount_tokens"] * cur - pos["amount_usd"]
+                        add_realized_pnl(daily_state, realized)
+                        _record_sell_outcome(realized, addr)
+                        del positions[addr]
+                    continue
+
+            # TP2: +30% and tp1 done -> sell remaining 50%
+            if pnl_pct >= 0.30 and pos.get("tp1_done") and not pos.get("tp2_done"):
+                sell_amt = pos["amount_tokens"] * 0.50
+                ok, _ = sell_token(addr, sym, sell_amt, f"Tier_D_TP2 +{pnl_pct:.0%}")
+                if ok:
+                    sold_usd = sell_amt * cur
+                    realized = sold_usd - pos["amount_usd"] * 0.50
+                    add_realized_pnl(daily_state, realized)
+                    _record_sell_outcome(realized, addr)
+                    pos["tp2_done"] = True
+                    pos["amount_tokens"] = pos["amount_tokens"] * 0.50
+                    pos["amount_usd"] = pos["amount_usd"] * 0.50
+                continue
+
+            # SL: -10% (tight for momentum plays)
+            if pnl_pct <= -0.10 and not pos.get("sl_done"):
+                ok, _ = sell_token(addr, sym, pos["amount_tokens"], f"Tier_D_SL {pnl_pct:.0%}")
+                if ok:
+                    realized = pos["amount_tokens"] * cur - pos["amount_usd"]
+                    add_realized_pnl(daily_state, realized)
+                    _record_sell_outcome(realized, addr)
+                    pos["sl_done"] = True
+                    del positions[addr]
+                continue
+
+            # Timeout: 6h
+            if age_h > 6 and not pos.get("timeout_done"):
+                ok, _ = sell_token(addr, sym, pos["amount_tokens"], f"Tier_D_timeout {age_h:.0f}h")
+                if ok:
+                    realized = pos["amount_tokens"] * cur - pos["amount_usd"]
+                    add_realized_pnl(daily_state, realized)
+                    _record_sell_outcome(realized, addr)
+                    pos["timeout_done"] = True
+                    del positions[addr]
+                continue
+
 
 # ─── 主程序 ───────────────────────────────────────────────────────────────────
 
@@ -1179,6 +1361,7 @@ def main():
     last_migrating_check  = 0
     last_new_check        = 0
     last_pos_check        = 0
+    last_hot_momentum_check = 0
 
     usdc = 200.0
 
@@ -1192,15 +1375,17 @@ def main():
     save_acted(acted)
 
     log("=" * 60)
-    log("SOL MEME HUNTER v5.3 — 三层预测架构 + 精准入场")
+    log("SOL MEME HUNTER v5.4 — 四层预测架构 + 动态仓位评分")
     log(f"Wallet: {WALLET}")
     log(f"Safety  DAY=${SAFETY_LINE_DAY}  NIGHT=${SAFETY_LINE_NIGHT}  DAILY_LOSS_LIMIT=${DAILY_LOSS_LIMIT}")
     log(f"Tier A size={TIER_A_SIZE}(night={TIER_A_NIGHT})  MC ${SM_MIN_MC}-${SM_MAX_MC}  liq ${SM_MIN_LIQ}-${SM_MAX_LIQ}")
     log(f"Tier B size={TIER_B_SIZE}(night={TIER_B_NIGHT})  bonding {MIN_BONDING}-{MAX_BONDING}%")
     log(f"Tier C size={TIER_C_SIZE}  bonding {MIN_BONDING_C}-{MAX_BONDING_C}%  MC ${TIER_C_MIN_MC}-${TIER_C_MAX_MC}  timeout={TIER_C_TIMEOUT_MIN}min  daily_limit={MAX_TIER_C_DAY}")
+    log(f"Tier D size={TIER_D_SIZE}(night={TIER_D_NIGHT})  MC ${TIER_D_MIN_MC//1000}k-${TIER_D_MAX_MC//1000000}M  holders>={TIER_D_MIN_HOLDERS}")
     log(f"Refresh  SM={SM_REFRESH}s  MIGRATING={MIGRATING_REFRESH}s  NEW={NEW_REFRESH}s  HOT={HOT_REFRESH}s")
-    log(f"v5.3: confidence_scoring | K1_pump_guard | TOP_ZONE_filter | FAST_DUMP | trailing_stop({TRAIL_DISTANCE_A:.0%}A/{TRAIL_DISTANCE_B:.0%}B)")
-    log(f"v5.3: time_decay_SL {TIME_DECAY_SL} | 3-check_protection | cooldown_dedup(30min) | session_pause({SESSION_CONSEC_LOSS_MAX}loss/{SESSION_CONSEC_PAUSE}s) | liq_emergency($5k)")
+    log(f"v5.4: confidence_scoring | K1_pump_guard | TOP_ZONE_filter | FAST_DUMP | trailing_stop({TRAIL_DISTANCE_A:.0%}A/{TRAIL_DISTANCE_B:.0%}B)")
+    log(f"v5.4: time_decay_SL {TIME_DECAY_SL} | 3-check_protection | cooldown_dedup(30min) | session_pause({SESSION_CONSEC_LOSS_MAX}loss/{SESSION_CONSEC_PAUSE}s) | liq_emergency($5k)")
+    log(f"v5.4: position_scoring | breakthrough_logic | hot_momentum_tier_D")
     log(f"Existing positions: {len(positions)}")
     log("=" * 60)
 
@@ -1481,6 +1666,77 @@ def main():
                     acted[addr] = time.time()
                     save_acted(acted)
             last_new_check = now
+
+        # -- Tier D: HOT MOMENTUM (every 60s) --
+        if now - last_hot_momentum_check > MIGRATING_REFRESH:
+            hot_momentum = fetch_hot_momentum_tokens()
+            log(f"Tier D HOT_MOMENTUM candidates: {len(hot_momentum)}")
+            for t in hot_momentum:
+                addr = t.get("tokenContractAddress", "")
+                sym = t.get("tokenSymbol", "?")
+                if not addr:
+                    continue
+                if is_acted(acted, addr) or addr in positions:
+                    continue
+                if time.time() < cooldown_until.get(addr, 0):
+                    remaining = cooldown_until[addr] - time.time()
+                    log(f"  COOLDOWN: {sym} skip {remaining:.0f}s left")
+                    continue
+                # Calculate position score with unique_traders
+                holders = int(sf(t.get("holders", 0)))
+                buy_tx = int(sf(t.get("txsBuy", 0)))
+                sell_tx = int(sf(t.get("txsSell", 0)))
+                unique_traders = int(sf(t.get("uniqueTraders", 0)))
+                score = calculate_position_score(holders, 0, buy_tx, sell_tx, unique_traders)
+                ok, size = entry_guard(positions, daily_state, usdc, "D", addr=addr, score=score)
+                if not ok:
+                    log(f"  SKIP Tier D {sym}: {size}")
+                    continue
+                sec_ok, sec_reason = security_check(addr)
+                if not sec_ok:
+                    log(f"  REJECT Tier D {sym} security: {sec_reason}")
+                    acted[addr] = time.time()
+                    save_acted(acted)
+                    continue
+                mc = sf(t.get("marketCap", 0))
+                log(f"ENTER TIER_D {sym} ${size} | MC=${mc:.0f} | holders={holders} | score={score}")
+                ok_swap, _ = execute_swap(USDC_ADDR, addr, size)
+                if ok_swap:
+                    entry_price = 0
+                    for _try in range(3):
+                        entry_price = get_token_price(addr)
+                        if entry_price > 0:
+                            break
+                        time.sleep(2)
+                    if entry_price <= 0:
+                        log(f"  WARN: {sym} price=0 after 3 retries")
+                        amt_tokens = 0
+                    else:
+                        amt_tokens = size / entry_price
+                    positions[addr] = {
+                        "sym": sym,
+                        "amount_usd": size,
+                        "amount_tokens": amt_tokens,
+                        "entry_price": entry_price,
+                        "entry_time": time.time(),
+                        "tier": "TIER_D",
+                        "tp1_done": False,
+                        "tp2_done": False,
+                        "holders_at_entry": holders,
+                        "peak_price": entry_price,
+                        "last_liq_check": 0,
+                        "zero_price_count": 0,
+                        "score": score,
+                    }
+                    acted[addr] = time.time()
+                    save_acted(acted)
+                    usdc -= size
+                    log(f"  ENTERED Tier D {sym} ${size} | USDC left: ${usdc:.1f}")
+                    break  # 1 per cycle limit
+                else:
+                    acted[addr] = time.time()
+                    save_acted(acted)
+            last_hot_momentum_check = now
 
         time.sleep(2)
 
