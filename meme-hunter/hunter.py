@@ -1453,7 +1453,16 @@ def can_enter():
             return False, f"SESSION_PAUSED ({remain}s)"
 
     with pos_lock:
-        if len(state["positions"]) >= config.MAX_POSITIONS:
+        # Only count positions that haven't covered cost yet
+        # Positions with tp_tier >= 1 (TP1 hit = cost covered) are "底仓" and don't count
+        # Stuck/zombie positions also don't count
+        active_count = sum(
+            1 for pos in state["positions"].values()
+            if pos.get("tp_tier", 0) < 1          # hasn't covered cost
+            and pos.get("sell_fail_count", 0) < 10  # not a zombie
+            and pos.get("remaining", 1.0) > 0.15    # not already mostly sold
+        )
+        if active_count >= config.MAX_POSITIONS:
             return False, "MAX_POSITIONS"
 
     return True, "OK"
@@ -1868,9 +1877,15 @@ def scanner_loop():
                 usd_bal = sol_bal * sol_price if sol_price > 0 else 0
                 with pos_lock:
                     n_pos = len(state["positions"])
+                    active_pos = sum(
+                        1 for p in state["positions"].values()
+                        if p.get("tp_tier", 0) < 1
+                        and p.get("sell_fail_count", 0) < 10
+                        and p.get("remaining", 1.0) > 0.15
+                    )
                 daily_loss = session_risk.get("cumulative_loss_usd", 0)
                 feed(f"SOL: {sol_bal:.4f} (~${usd_bal:.2f}) | "
-                     f"Daily PnL: ${-daily_loss:+.2f} | Positions: {n_pos}")
+                     f"Daily PnL: ${-daily_loss:+.2f} | Positions: {active_pos} active / {n_pos} total")
 
             # Tier A: Smart Money (every SM_REFRESH_SEC)
             if now - last_a >= config.SM_REFRESH_SEC:
@@ -1943,7 +1958,13 @@ def main():
 
     with pos_lock:
         n_pos = len(state["positions"])
-    feed(f"  Loaded: {n_pos} positions, {len(acted)} acted, {len(state['trades'])} trades")
+        active_pos = sum(
+            1 for p in state["positions"].values()
+            if p.get("tp_tier", 0) < 1
+            and p.get("sell_fail_count", 0) < 10
+            and p.get("remaining", 1.0) > 0.15
+        )
+    feed(f"  Loaded: {n_pos} positions ({active_pos} active), {len(acted)} acted, {len(state['trades'])} trades")
 
     # 4. Position takeover
     takeover_existing_positions()
@@ -1962,7 +1983,7 @@ def main():
          f"CONSEC_PAUSE={config.MAX_CONSEC_LOSS}x/{config.PAUSE_CONSEC_SEC}s")
     feed(f"Scan intervals: SM={config.SM_REFRESH_SEC}s B={config.GRADUATED_REFRESH_SEC}s "
          f"D={config.HOT_REFRESH_SEC}s MON={config.MONITOR_SEC}s")
-    feed(f"Existing positions: {n_pos}")
+    feed(f"Existing positions: {active_pos} active / {n_pos} total")
     print("=" * 60)
 
     # 6. Start dashboard
