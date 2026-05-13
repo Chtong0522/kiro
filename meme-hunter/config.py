@@ -125,31 +125,32 @@ TIER_D_UNIQUE_TRADERS  = 0            # 热门币API不返回此字段,禁用 | 
 
 # ── Take Profit / 止盈策略 ─────────────────────────────────────────────────
 # 核心原则: 永远不卖完, 留底仓 (never sell 100%, always keep a floor position)
+# 出本逻辑: TP1 +50% 卖67% ≈ 收回本金, 剩余全是利润
 # pct = 目标涨幅, sell = 卖出比例(占当时持仓), trail = 追踪止盈回撤比例
 
 TP_RULES = {
     "A": {
-        "tp1_pct": 0.15,       # +15% 卖50% (出本) | +15% sell 50% (cover cost)
-        "tp1_sell": 0.50,
-        "tp2_pct": 0.50,       # +50% 卖50% (锁利) | +50% sell 50% (lock profit)
+        "tp1_pct": 0.50,       # +50% 卖67% (出本: $5*1.5*0.67≈$5.025) | +50% sell 67% (cover cost)
+        "tp1_sell": 0.67,
+        "tp2_pct": 1.00,       # +100% 卖50% (锁利) | +100% sell 50% (lock profit)
         "tp2_sell": 0.50,
         "trailing_pct": 0.15,  # TP1后追踪15%回撤卖50% | 15% trailing after TP1 sell 50%
         "trailing_sell": 0.50, # 追踪止盈卖出比例 | Trailing sell ratio
         "floor_pct": 0.10,     # 永远保留10%底仓 | Always keep 10% floor position
     },
     "B": {
-        "tp1_pct": 0.20,       # +20% 卖50% | +20% sell 50%
-        "tp1_sell": 0.50,
-        "tp2_pct": 0.50,       # +50% 卖50% | +50% sell 50%
+        "tp1_pct": 0.50,       # +50% 卖67% (出本) | +50% sell 67% (cover cost)
+        "tp1_sell": 0.67,
+        "tp2_pct": 1.00,       # +100% 卖50% | +100% sell 50%
         "tp2_sell": 0.50,
         "trailing_pct": 0.12,  # 追踪12%回撤 | 12% trailing
         "trailing_sell": 0.50,
         "floor_pct": 0.10,     # 保留10%底仓 | Keep 10% floor
     },
     "D": {
-        "tp1_pct": 0.15,       # +15% 卖50% | +15% sell 50%
-        "tp1_sell": 0.50,
-        "tp2_pct": 0.50,       # +50% 卖50% | +50% sell 50%
+        "tp1_pct": 0.50,       # +50% 卖67% (出本) | +50% sell 67% (cover cost)
+        "tp1_sell": 0.67,
+        "tp2_pct": 1.00,       # +100% 卖50% | +100% sell 50%
         "tp2_sell": 0.50,
         "trailing_pct": 0.12,  # 追踪12%回撤 | 12% trailing
         "trailing_sell": 0.50,

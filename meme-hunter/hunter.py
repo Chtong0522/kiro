@@ -94,6 +94,11 @@ def load_positions():
             pos["entry_ts"] = pos.get("opened_at_ts") or now
         if not pos.get("opened_at_ts"):
             pos["opened_at_ts"] = pos.get("entry_ts") or now
+        # Migration: ensure remaining and sl1_triggered fields exist
+        if "remaining" not in pos:
+            pos["remaining"] = 1.0
+        if "sl1_triggered" not in pos:
+            pos["sl1_triggered"] = False
 
 
 def save_positions():
@@ -1166,7 +1171,13 @@ def _monitor_cycle():
                 state["positions"][addr]["pnl_pct"] = pnl_pct
                 state["positions"][addr]["age_min"] = age_min
 
-        # ── Layer 1: HE1 Emergency ──
+        # ── Precompute floor & SL/TP rules for this position ──
+        tp_rules = config.TP_RULES.get(tier, config.TP_RULES.get("D", {}))
+        sl_rules = config.SL_RULES.get(tier, config.SL_RULES.get("D", {}))
+        floor_pct = safe_float(tp_rules.get("floor_pct", 0.0))
+        remaining = safe_float(pos.get("remaining", 1.0))
+
+        # ── Layer 1: HE1 Emergency (override floor - sell everything) ──
         if pnl_pct <= config.HE1_PCT:
             _exit_position(addr, pos, 1.0, "HE1_EMERGENCY", pnl_pct)
             continue
@@ -1188,7 +1199,7 @@ def _monitor_cycle():
                 if addr in state["positions"]:
                     state["positions"][addr]["last_peak_ts"] = now
 
-        # ── Layer 3: LIQ_EMERGENCY ──
+        # ── Layer 3: LIQ_EMERGENCY (override floor - sell everything) ──
         liq_check_interval = 300  # 5 min
         last_liq_check = safe_float(pos.get("last_liq_check", 0))
         if cur_liq > 0 and (now - last_liq_check) >= liq_check_interval:
@@ -1199,11 +1210,30 @@ def _monitor_cycle():
                 _exit_position(addr, pos, 1.0, "LIQ_EMERGENCY", pnl_pct)
                 continue
 
-        # ── Layer 4: Hard Stop Loss ──
-        sl_rules = config.SL_RULES.get(tier, config.SL_RULES.get("D", {}))
-        hard_sl = safe_float(sl_rules.get("sl_pct", -0.15))
-        if pnl_pct <= hard_sl:
-            _exit_position(addr, pos, 1.0, f"HARD_SL({hard_sl:.0%})", pnl_pct)
+        # ── Layer 4: Tiered Stop Loss ──
+        sl_pct = safe_float(sl_rules.get("sl_pct", -0.15))
+        sl_sell = safe_float(sl_rules.get("sl_sell", 1.0))
+        sl2_pct = safe_float(sl_rules.get("sl2_pct", sl_pct - 0.08))
+        sl2_sell = safe_float(sl_rules.get("sl2_sell", 1.0))
+        sl1_triggered = pos.get("sl1_triggered", False)
+
+        if not sl1_triggered and pnl_pct <= sl_pct:
+            # First tier stop loss - partial sell with floor protection
+            if remaining <= floor_pct + 0.01:
+                pass  # already at floor, skip SL1
+            else:
+                max_sellable = (remaining - floor_pct) / remaining if remaining > 0 else 0
+                actual_sell = min(sl_sell, max_sellable)
+                if actual_sell >= 0.05:
+                    _exit_position(addr, pos, actual_sell, f"SL1({sl_pct*100:.0f}%)", pnl_pct)
+                    with pos_lock:
+                        if addr in state["positions"]:
+                            state["positions"][addr]["sl1_triggered"] = True
+                    continue
+
+        elif sl1_triggered and pnl_pct <= sl2_pct:
+            # Second tier - sell remaining (ignore floor for SL2)
+            _exit_position(addr, pos, sl2_sell, f"SL2({sl2_pct*100:.0f}%)", pnl_pct)
             continue
 
         # ── Layer 5: Time-decay SL ──
@@ -1213,9 +1243,19 @@ def _monitor_cycle():
             after_min, tighten_to = rule[0], rule[1]
             if age_min >= after_min:
                 if pnl_pct <= tighten_to:
-                    _exit_position(addr, pos, 1.0,
-                                   f"TIME_DECAY_SL({after_min}m/{tighten_to:.0%})", pnl_pct)
-                    td_exit = True
+                    # Time decay SL with floor protection
+                    if remaining <= floor_pct + 0.01:
+                        td_exit = False  # at floor, skip
+                    else:
+                        max_sellable = (remaining - floor_pct) / remaining if remaining > 0 else 0
+                        actual_sell = min(sl_sell, max_sellable)
+                        if actual_sell >= 0.05:
+                            _exit_position(addr, pos, actual_sell,
+                                           f"TIME_DECAY_SL({after_min}m/{tighten_to:.0%})", pnl_pct)
+                            with pos_lock:
+                                if addr in state["positions"]:
+                                    state["positions"][addr]["sl1_triggered"] = True
+                            td_exit = True
                 break
         if td_exit:
             continue
@@ -1226,16 +1266,23 @@ def _monitor_cycle():
             _exit_position(addr, pos, 1.0, "TIMEOUT", pnl_pct)
             continue
 
-        # ── Layer 7: Trailing Stop (after TP1) ──
+        # ── Layer 7: Trailing Stop (after TP1) with floor protection ──
         tp_tier_done = safe_int(pos.get("tp_tier", 0))
-        tp_rules = config.TP_RULES.get(tier, config.TP_RULES.get("D", {}))
         trailing_pct = safe_float(tp_rules.get("trailing_pct", 0.10))
+        trailing_sell = safe_float(tp_rules.get("trailing_sell", 0.50))
 
         if tp_tier_done >= 1 and peak_price > entry_price:
             drop_from_peak = (peak_price - cur_price) / peak_price
             if drop_from_peak >= trailing_pct:
-                _exit_position(addr, pos, 1.0, f"TRAILING({trailing_pct:.0%})", pnl_pct)
-                continue
+                # Floor protection for trailing stop
+                if remaining <= floor_pct + 0.01:
+                    pass  # already at floor, skip trailing sell
+                else:
+                    max_sellable = (remaining - floor_pct) / remaining if remaining > 0 else 0
+                    actual_sell = min(trailing_sell, max_sellable)
+                    if actual_sell >= 0.05:
+                        _exit_position(addr, pos, actual_sell, f"TRAILING({trailing_pct:.0%})", pnl_pct)
+                        continue
 
         # ── Tiered Take Profit ──
         # If force_exit_at_tp is set (from EXIT_NEXT_TP risk flag), exit immediately at any profit
@@ -1244,24 +1291,38 @@ def _monitor_cycle():
             continue
 
         if tp_tier_done == 0:
-            tp1_pct = safe_float(tp_rules.get("tp1_pct", 0.15))
-            tp1_sell = safe_float(tp_rules.get("tp1_sell", 0.60))
+            tp1_pct = safe_float(tp_rules.get("tp1_pct", 0.50))
+            tp1_sell = safe_float(tp_rules.get("tp1_sell", 0.67))
             if pnl_pct >= tp1_pct:
-                _exit_position(addr, pos, tp1_sell, f"TP1(+{tp1_pct:.0%})", pnl_pct)
-                with pos_lock:
-                    if addr in state["positions"]:
-                        state["positions"][addr]["tp_tier"] = 1
-                continue
+                # Floor protection for TP1
+                if remaining <= floor_pct + 0.01:
+                    pass  # already at floor, skip TP1 sell
+                else:
+                    max_sellable = (remaining - floor_pct) / remaining if remaining > 0 else 0
+                    actual_sell = min(tp1_sell, max_sellable)
+                    if actual_sell >= 0.05:
+                        _exit_position(addr, pos, actual_sell, f"TP1(+{tp1_pct:.0%})", pnl_pct)
+                        with pos_lock:
+                            if addr in state["positions"]:
+                                state["positions"][addr]["tp_tier"] = 1
+                        continue
 
         if tp_tier_done == 1:
-            tp2_pct = safe_float(tp_rules.get("tp2_pct", 0.30))
+            tp2_pct = safe_float(tp_rules.get("tp2_pct", 1.00))
             tp2_sell = safe_float(tp_rules.get("tp2_sell", 0.50))
             if pnl_pct >= tp2_pct:
-                _exit_position(addr, pos, tp2_sell, f"TP2(+{tp2_pct:.0%})", pnl_pct)
-                with pos_lock:
-                    if addr in state["positions"]:
-                        state["positions"][addr]["tp_tier"] = 2
-                continue
+                # Floor protection for TP2
+                if remaining <= floor_pct + 0.01:
+                    pass  # already at floor, skip TP2 sell
+                else:
+                    max_sellable = (remaining - floor_pct) / remaining if remaining > 0 else 0
+                    actual_sell = min(tp2_sell, max_sellable)
+                    if actual_sell >= 0.05:
+                        _exit_position(addr, pos, actual_sell, f"TP2(+{tp2_pct:.0%})", pnl_pct)
+                        with pos_lock:
+                            if addr in state["positions"]:
+                                state["positions"][addr]["tp_tier"] = 2
+                        continue
 
     # Post-trade flags (background, throttled)
     for addr, pos in positions.items():
@@ -1353,6 +1414,9 @@ def _exit_position(addr, pos, sell_ratio, reason, pnl_pct):
                     state["positions"][addr]["token_amount"] = token_amount - sell_amount
                     state["positions"][addr]["size_usd"] = size_usd * (1 - sell_ratio)
                     state["positions"][addr]["sell_fail_count"] = 0
+                    # Update remaining ratio
+                    old_remaining = safe_float(state["positions"][addr].get("remaining", 1.0))
+                    state["positions"][addr]["remaining"] = old_remaining * (1 - sell_ratio)
             save_positions()
 
         pnl_display = f"{pnl_pct*100:+.1f}%"
@@ -1578,6 +1642,8 @@ def takeover_existing_positions():
                     "risk_last_checked": 0,
                     "entry_top10": 0,
                     "entry_sniper_pct": 0,
+                    "remaining": 1.0,
+                    "sl1_triggered": False,
                 }
             taken += 1
 
@@ -1625,6 +1691,8 @@ def _create_position(addr, symbol, tier, size_usd, price, mc, liq,
             "entry_sniper_pct": entry_sniper,
             "pnl_pct": 0.0,
             "age_min": 0.0,
+            "remaining": 1.0,
+            "sl1_triggered": False,
         }
         save_positions()
 
@@ -1660,6 +1728,8 @@ def _create_unconfirmed_position(addr, symbol, tier, size_usd, price, mc):
             "unconfirmed": True,
             "unconfirmed_ts": now,
             "unconfirmed_checks": 0,
+            "remaining": 1.0,
+            "sl1_triggered": False,
         }
         save_positions()
 
