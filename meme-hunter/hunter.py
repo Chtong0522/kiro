@@ -87,6 +87,14 @@ def load_positions():
     except (FileNotFoundError, json.JSONDecodeError):
         state["positions"] = {}
 
+    # Migration: ensure all loaded positions have entry_ts
+    now = time.time()
+    for addr, pos in state["positions"].items():
+        if not pos.get("entry_ts"):
+            pos["entry_ts"] = pos.get("opened_at_ts") or now
+        if not pos.get("opened_at_ts"):
+            pos["opened_at_ts"] = pos.get("entry_ts") or now
+
 
 def save_positions():
     """Atomic write positions. Caller must hold pos_lock."""
@@ -1025,11 +1033,23 @@ def _monitor_cycle():
 
     now = time.time()
 
+    # Defensive: ensure all positions have entry_ts populated.
+    # Positions loaded from older versions or with corrupted data may lack it.
+    for addr, pos in positions.items():
+        pos_ts = pos.get("entry_ts") or pos.get("opened_at_ts")
+        if not pos_ts:
+            with pos_lock:
+                if addr in state["positions"]:
+                    state["positions"][addr]["entry_ts"] = now
+                    state["positions"][addr]["opened_at_ts"] = now
+            pos["entry_ts"] = now
+            pos["opened_at_ts"] = now
+
     # Handle unconfirmed positions first
     for addr, pos in list(positions.items()):
         if not pos.get("unconfirmed"):
             continue
-        elapsed = now - pos.get("unconfirmed_ts", pos.get("opened_at_ts", 0))
+        elapsed = now - pos.get("unconfirmed_ts", pos.get("opened_at_ts", 0) or pos.get("entry_ts", 0) or now)
         if elapsed < 60:
             continue
         checks = pos.get("unconfirmed_checks", 0)
@@ -1087,7 +1107,17 @@ def _monitor_cycle():
 
         entry_price = safe_float(pos.get("entry_price", 0))
         if entry_price <= 0:
-            continue
+            # Recovery: if current price is available, set entry_price to current
+            # price so the position becomes monitorable (prevents permanent skip)
+            if cur_price > 0:
+                with pos_lock:
+                    if addr in state["positions"]:
+                        state["positions"][addr]["entry_price"] = cur_price
+                        state["positions"][addr]["peak_price"] = cur_price
+                entry_price = cur_price
+                feed(f"  RECOVERY {pos.get('symbol', addr[:8])}: entry_price was 0, set to {cur_price}")
+            else:
+                continue
 
         # 3-check protection: if price is 0, increment zero count
         if cur_price <= 0:
@@ -1099,7 +1129,7 @@ def _monitor_cycle():
                         # Ghost cleanup: if zero_count >= 30 (30+ consecutive seconds
                         # of zero price) AND position age > 24 hours, auto-remove
                         # to prevent permanently blocked slots.
-                        age_sec = now - safe_float(pos.get("opened_at_ts", now))
+                        age_sec = now - safe_float(pos.get("entry_ts") or pos.get("opened_at_ts") or now)
                         if zc >= 30 and age_sec > 86400:
                             state["positions"].pop(addr, None)
                             save_positions()
@@ -1114,7 +1144,8 @@ def _monitor_cycle():
                     state["positions"][addr]["zero_count"] = 0
 
         pnl_pct = (cur_price - entry_price) / entry_price
-        age_sec = now - safe_float(pos.get("opened_at_ts", now))
+        entry_ts = safe_float(pos.get("entry_ts") or pos.get("opened_at_ts") or now)
+        age_sec = now - entry_ts
         age_min = age_sec / 60.0
         tier = pos.get("tier", "D")
         token_amount = safe_float(pos.get("token_amount", 0))
@@ -1538,6 +1569,7 @@ def takeover_existing_positions():
                     "entry_liq": liq,
                     "opened_at": datetime.now(timezone.utc).isoformat(),
                     "opened_at_ts": time.time(),
+                    "entry_ts": time.time(),
                     "tp_tier": 0,
                     "zero_count": 0,
                     "sell_fail_count": 0,
@@ -1582,6 +1614,7 @@ def _create_position(addr, symbol, tier, size_usd, price, mc, liq,
             "tx_hash": tx_hash or "",
             "opened_at": datetime.now(timezone.utc).isoformat(),
             "opened_at_ts": now,
+            "entry_ts": now,
             "tp_tier": 0,
             "zero_count": 0,
             "sell_fail_count": 0,
@@ -1615,6 +1648,7 @@ def _create_unconfirmed_position(addr, symbol, tier, size_usd, price, mc):
             "entry_liq": 0,
             "opened_at": datetime.now(timezone.utc).isoformat(),
             "opened_at_ts": now,
+            "entry_ts": now,
             "tp_tier": 0,
             "zero_count": 0,
             "sell_fail_count": 0,
