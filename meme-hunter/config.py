@@ -59,7 +59,7 @@ SM_LABELS          = [1, 2, 3]  # 1=SmartMoney 2=KOL 3=Whale
 # -- Deep Verification / 深度验证 --
 TIER_A_MC_MIN         = 100_000    # was 200_000 | 最低市值 $100K (从$200K降低) | Min market cap $100K (lowered from $200K)
 TIER_A_MC_MAX         = 2_000_000  # 最高市值 $2M | Max market cap $2M
-TIER_A_LIQ_MIN        = 40_000     # was 80_000 | 最低流动性 $40K (从$80K降低) | Min liquidity $40K (lowered from $80K)
+TIER_A_LIQ_MIN        = 25_000     # 最低流动性 $25K | Min liquidity $25K
 TIER_A_HOLDERS_MIN    = 150        # was 300 | 最低持有人数 150 (从300降低) | Min holders 150 (lowered from 300)
 TIER_A_DEV_RUG        = 0          # Dev rug次数必须=0 | Dev rug count must be 0
 TIER_A_BUNDLER_ATH    = 25.0       # Bundler ATH占比上限 25% | Bundler ATH max 25%
@@ -81,7 +81,7 @@ TIER_B_SIZE_NIGHT  = 3     # 夜间每笔 $3 | Night trade size $3
 
 # -- Stage & Timing / 阶段与时机 --
 TIER_B_STAGE       = "MIGRATED"  # 毕业阶段 (关键!) | Graduation stage (CRITICAL!)
-TIER_B_MAX_AGE_MIN = 30          # 毕业后最大年龄 30分钟 | Max age after graduation 30min
+TIER_B_MAX_AGE_MIN = 120         # 毕业后最大年龄 120分钟(2h) | Max age after graduation 2h
 
 # -- Filters / 过滤条件 --
 TIER_B_MC_MIN      = 50_000      # 最低市值 $50K | Min market cap $50K
@@ -90,7 +90,7 @@ TIER_B_HOLDERS_MIN = 100         # 最低持有人 | Min holders
 TIER_B_DEV_SOLD    = True        # Dev必须已卖出 | Dev must have sold
 TIER_B_INSIDERS_MAX = 15.0       # 内部人占比上限 15% | Insiders max 15%
 TIER_B_TOP10_MAX   = 40.0        # Top10持仓上限 40% | Top10 holdings max 40%
-TIER_B_APED_MIN    = 1           # 至少1个大户冲入 | At least 1 whale aped in
+TIER_B_APED_MIN    = 0           # 不要求大户冲入(API大部分返回0) | No aped requirement (API mostly returns 0)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TIER D: Hot Momentum / 热门趋势动量
