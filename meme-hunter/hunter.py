@@ -506,7 +506,12 @@ def check_volume_confirmation(addr, symbol="?"):
             if first_half_vol > 0 and second_half_vol < first_half_vol * 0.3:
                 return False, "vol_declining_rapidly"
 
-        return True, f"vol=${total_volume:.0f} green={green_count}/5"
+        # V7: Also check buy/sell ratio from recent trades
+        bs_ratio, bs_pass = check_buy_sell_ratio(addr)
+        if not bs_pass:
+            return False, f"buy_sell_ratio={bs_ratio:.2f}<{config.VOLUME_BUY_SELL_RATIO}"
+
+        return True, f"vol=${total_volume:.0f} green={green_count}/5 bs={bs_ratio:.1f}"
 
     except Exception:
         # On error, allow entry (don't block on API failures)
