@@ -714,12 +714,17 @@ def process_tier_b():
         if not addr or addr in _NEVER_TRADE:
             continue
 
-        mc = safe_float(tok.get("marketCap", 0) or tok.get("usdMarketCap", 0))
-        holders = safe_int(tok.get("holders", 0) or tok.get("holderCount", 0))
-        dev_sold = tok.get("devSold", False) or tok.get("creatorClose", False)
-        insiders_pct = safe_float(tok.get("insiderPercent", 0) or tok.get("insiderHoldingPercent", 0))
-        top10 = safe_float(tok.get("top10HoldPercent", 0) or tok.get("top10Percent", 0))
-        aped = safe_int(tok.get("apedCount", 0) or tok.get("smartMoneyCount", 0))
+        # API returns nested structure: market.marketCapUsd, tags.totalHolders, etc.
+        market = tok.get("market", {}) if isinstance(tok.get("market"), dict) else {}
+        tags = tok.get("tags", {}) if isinstance(tok.get("tags"), dict) else {}
+
+        mc = safe_float(market.get("marketCapUsd", 0) or tok.get("marketCap", 0))
+        holders = safe_int(tags.get("totalHolders", 0) or tok.get("holders", 0))
+        dev_hold_pct = safe_float(tags.get("devHoldingsPercent", 0))
+        dev_sold = dev_hold_pct == 0  # dev sold = devHoldingsPercent is 0
+        insiders_pct = safe_float(tags.get("insidersPercent", 0) or tok.get("insiderPercent", 0))
+        top10 = safe_float(tags.get("top10HoldingsPercent", 0) or tok.get("top10HoldPercent", 0))
+        aped = safe_int(tok.get("aped", 0))  # "aped" is a top-level string field
 
         if mc < config.TIER_B_MC_MIN or mc > config.TIER_B_MC_MAX:
             continue
@@ -739,8 +744,9 @@ def process_tier_b():
         now_sec = time.time()
         max_age_sec = config.TIER_B_MAX_AGE_MIN * 60
         migrated_ts = safe_float(
-            tok.get("migratedTime", 0) or tok.get("graduatedAt", 0)
-            or tok.get("createdTime", 0) or tok.get("migrationTime", 0)
+            tok.get("migratedBeginTimestamp", 0) or tok.get("migratedEndTimestamp", 0)
+            or tok.get("migratedTime", 0) or tok.get("createdTimestamp", 0)
+            or tok.get("graduatedAt", 0)
         )
         if migrated_ts > 0:
             # Handle both seconds and milliseconds timestamps
@@ -754,6 +760,10 @@ def process_tier_b():
 
         filtered.append({"addr": addr, "mc": mc, "holders": holders,
                          "symbol": tok.get("symbol", tok.get("tokenSymbol", "?"))})
+
+    if candidates and not filtered:
+        # Log why all candidates were filtered (helps debugging)
+        feed(f"  Tier B: {len(candidates)} tokens from API, all filtered")
 
     feed(f"Tier B MIGRATED candidates: {len(filtered)}")
 
