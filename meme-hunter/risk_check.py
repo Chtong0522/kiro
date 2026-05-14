@@ -1,6 +1,6 @@
 """
 risk_check.py - Standalone pre/post trade risk assessment for Solana meme tokens.
-Drop-in module for SOL Meme Hunter v6 and any onchainos-based strategy.
+Drop-in module for SOL Meme Hunter v7 and any onchainos-based strategy.
 
 OVERVIEW
 --------
@@ -20,8 +20,7 @@ Grade 4 - HARD BLOCK. Do not enter. Abort immediately.
 Grade 3 - STRONG WARNING. Do not enter. Too risky.
   Triggers: serial rugger (>=3 rugs), rug rate >50%, LP <80% burned,
             volume plunge tag, snipers >15%, suspicious wallets >10%,
-            wash trading (round-trip wallets), single LP provider with unburned LP,
-            coordinated holder sells (dev/whale/insider/sniper >=2 sells in 10 min).
+            wash trading (round-trip wallets), single LP provider with unburned LP.
 
 Grade 2 - CAUTION. Proceed with awareness. Log the flags.
   Triggers: top 10 wallets hold >30%, bundles still in >5%, dev sold all (non-CTO),
@@ -30,6 +29,15 @@ Grade 2 - CAUTION. Proceed with awareness. Log the flags.
 Grade 0 - PASS. All checks clear.
 
 result["pass"] is True when grade < 3 (grades 0 and 2 are both tradeable).
+
+V7 CHANGES
+----------
+- Holder selling moved from G3 pre-trade to post-trade EXIT_NEXT_TP only
+  (normal profit-taking should not block entry)
+- post_trade_flags: HOLDER_SELLING now triggers EXIT_NEXT_TP instead of EXIT_NOW
+  (V6 was too aggressive, causing premature exits on normal profit-taking)
+- Selling velocity thresholds relaxed slightly for post-trade (warn only, don't instant-exit
+  unless it's truly massive)
 
 CLI USAGE
 ---------
@@ -594,9 +602,12 @@ def post_trade_flags(addr: str, sym: str,
         flags.append(f"EXIT_NOW: ACTIVE_DUMP -- {vel_detail}")
 
     # Holder selling - coordinated exits
+    # V7: Downgraded from EXIT_NOW to EXIT_NEXT_TP
+    # Reason: Normal profit-taking by whales/insiders is common and doesn't mean rug.
+    # Only dev liquidity removal (checked above) warrants immediate exit.
     is_selling, sell_reason = _holder_sell_check(addr)
     if is_selling:
-        flags.append(f"EXIT_NOW: {sell_reason}")
+        flags.append(f"EXIT_NEXT_TP: {sell_reason}")
 
     # Volume collapsing - exit at next TP
     if _has_tag(info, "volumeChangeRateVolumePlunge"):
