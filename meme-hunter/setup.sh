@@ -1,10 +1,11 @@
 #!/bin/bash
-# SOL Meme Hunter v6.0 - One-Command Server Setup
+# SOL Meme Hunter v7.0 - One-Command Server Setup
 # For Ubuntu 20.04/22.04 (AWS/Lightsail/Cloud)
 set -e
 
 echo "================================================"
-echo "  SOL Meme Hunter v6.0 - Server Setup"
+echo "  SOL Meme Hunter v7.0 - Server Setup"
+echo "  4-Tier (S/A/B/D) + Smart Wallet Signal"
 echo "================================================"
 
 # 1. System packages
@@ -38,8 +39,8 @@ onchainos --version
 echo "[4/6] Creating ~/meme-hunter directory..."
 mkdir -p ~/meme-hunter
 
-# 5. Copy all v6 files
-echo "[5/6] Copying v6 files..."
+# 5. Copy all v7 files
+echo "[5/6] Copying v7 files..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cp "$SCRIPT_DIR/config.py" ~/meme-hunter/
 cp "$SCRIPT_DIR/risk_check.py" ~/meme-hunter/
@@ -47,7 +48,8 @@ cp "$SCRIPT_DIR/hunter.py" ~/meme-hunter/
 cp "$SCRIPT_DIR/dashboard.html" ~/meme-hunter/
 cp "$SCRIPT_DIR/SKILL.md" ~/meme-hunter/
 cp "$SCRIPT_DIR/start.sh" ~/meme-hunter/
-echo "  Copied: config.py risk_check.py hunter.py dashboard.html SKILL.md start.sh"
+cp "$SCRIPT_DIR/smart_wallets_page_all_all_202605141414.csv" ~/meme-hunter/
+echo "  Copied: config.py risk_check.py hunter.py dashboard.html SKILL.md start.sh smart_wallets.csv"
 
 # 6. Set permissions
 echo "[6/6] Setting permissions..."
@@ -63,5 +65,5 @@ echo "    2. onchainos wallet status    (verify login)"
 echo "    3. ~/meme-hunter/start.sh     (start the bot)"
 echo ""
 echo "  Dashboard: http://localhost:3250"
-echo "  Log file:  /tmp/meme_hunter_v6.log"
+echo "  Log file:  /tmp/meme_hunter_v7.log"
 echo "================================================"
