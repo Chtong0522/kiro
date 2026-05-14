@@ -334,7 +334,7 @@ PAUSE_CONSEC_SEC   = 900          # V7: 600s -> 900s (15min, 冷静更久)
 DAILY_LOSS_LIMIT   = 20           # V7: $15 -> $20 (因为单笔更大)
 DAILY_LOSS_ACTION  = "pause"      # V7: "stop" -> "pause" (暂停30min而不是停机)
 DAILY_LOSS_PAUSE   = 1800         # 触发日亏损限制后暂停30min
-MAX_POSITIONS      = 5            # V7: 6 -> 5 (少而精)
+MAX_POSITIONS      = 8            # 最大同时持仓数 (8个 = 更多机会)
 STARTUP_COOLDOWN   = 120          # V7: 180s -> 120s
 
 # ── Scan Intervals / 扫描间隔 ─────────────────────────────────────────────
