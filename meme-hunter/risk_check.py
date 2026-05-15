@@ -324,7 +324,7 @@ def pre_trade_checks(addr, sym, quick=True):
         level = 4
 
     risk_lvl = _int_val(info, "riskControlLevel")
-    if risk_lvl >= 1:
+    if risk_lvl >= 2:
         reasons.append(f"G3: OKX_RISK_LEVEL={risk_lvl} (any risk blocked)")
         level = max(level, 3)
 
