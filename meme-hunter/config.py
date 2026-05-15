@@ -57,9 +57,9 @@ _PRESETS = {
         "VOLUME_5M_MIN_USD": 15_000,
         "VOLUME_BUY_SELL_RATIO": 1.5,
         # Take profit (higher TP1 = need bigger move to cover cost)
-        "TP1_PCT": 1.50, "TP1_SELL": 0.50,
-        "TP2_PCT": 3.50, "TP2_SELL": 0.30,
-        "TP3_PCT": 8.00, "TP3_SELL": 0.30,
+        "TP1_PCT": 0.50, "TP1_SELL": 0.70,
+        "TP2_PCT": 2.50, "TP2_SELL": 0.30,
+        "TP3_PCT": 6.00, "TP3_SELL": 0.30,
         # Stop loss (tighter = cut losses faster)
         "SL1_PCT": -0.15, "SL1_SELL": 0.50,
         "SL2_PCT": -0.25, "SL2_SELL": 1.0,
@@ -88,10 +88,10 @@ _PRESETS = {
         # Volume (stricter: must have real activity)
         "VOLUME_5M_MIN_USD": 10_000,
         "VOLUME_BUY_SELL_RATIO": 1.3,
-        # Take profit
-        "TP1_PCT": 1.00, "TP1_SELL": 0.50,
-        "TP2_PCT": 3.00, "TP2_SELL": 0.30,
-        "TP3_PCT": 8.00, "TP3_SELL": 0.30,
+        # Take profit (TP1=+35% 出本金，剩余免费奔跑)
+        "TP1_PCT": 0.35, "TP1_SELL": 0.75,
+        "TP2_PCT": 2.00, "TP2_SELL": 0.30,
+        "TP3_PCT": 5.00, "TP3_SELL": 0.30,
         # Stop loss
         "SL1_PCT": -0.20, "SL1_SELL": 0.50,
         "SL2_PCT": -0.30, "SL2_SELL": 1.0,
@@ -121,9 +121,9 @@ _PRESETS = {
         "VOLUME_5M_MIN_USD": 8_000,
         "VOLUME_BUY_SELL_RATIO": 1.1,
         # Take profit (earlier TP1 to secure gains faster in volatile markets)
-        "TP1_PCT": 0.80, "TP1_SELL": 0.50,
-        "TP2_PCT": 2.50, "TP2_SELL": 0.30,
-        "TP3_PCT": 6.00, "TP3_SELL": 0.30,
+        "TP1_PCT": 0.30, "TP1_SELL": 0.75,
+        "TP2_PCT": 1.50, "TP2_SELL": 0.30,
+        "TP3_PCT": 4.00, "TP3_SELL": 0.30,
         # Stop loss (wider but still disciplined)
         "SL1_PCT": -0.25, "SL1_SELL": 0.50,
         "SL2_PCT": -0.35, "SL2_SELL": 1.0,

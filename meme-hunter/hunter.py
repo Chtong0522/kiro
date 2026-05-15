@@ -1397,7 +1397,7 @@ def _monitor_cycle():
         sl_pct = safe_float(sl_rules.get("sl_pct", -0.20))
         sl2_pct = safe_float(sl_rules.get("sl2_pct", -0.30))
 
-        if not sl1_triggered and pnl_pct <= sl_pct and tp_tier_done < 1:
+        if not sl1_triggered and pnl_pct <= sl_pct:
             sl_sell = safe_float(sl_rules.get("sl_sell", 0.50))
             _exit_position(addr, pos, sl_sell, f"SL1({sl_pct*100:.0f}%)", pnl_pct)
             with _pos_lock:
@@ -1405,16 +1405,15 @@ def _monitor_cycle():
                     state["positions"][addr]["sl1_triggered"] = True
             continue
 
-        if pnl_pct <= sl2_pct and tp_tier_done < 1:
+        if pnl_pct <= sl2_pct:
             _exit_position(addr, pos, 1.0, f"SL2({sl2_pct*100:.0f}%)", pnl_pct)
             continue
 
         # ─── LAYER 5: TIME-DECAY STOP LOSS ──────────────────────────
-        if tp_tier_done < 1:
-            for min_threshold, sl_thresh in sl_rules.get("time_decay", []):
-                if age_min >= min_threshold and pnl_pct <= sl_thresh:
-                    _exit_position(addr, pos, 0.50, f"TIME_DECAY({min_threshold}m)", pnl_pct)
-                    break
+        for min_threshold, sl_thresh in sl_rules.get("time_decay", []):
+            if age_min >= min_threshold and pnl_pct <= sl_thresh:
+                _exit_position(addr, pos, 0.50, f"TIME_DECAY({min_threshold}m)", pnl_pct)
+                break
 
         # ─── LAYER 6: TIMEOUT ────────────────────────────────────────
         timeout_hrs = safe_float(sl_rules.get("timeout_hrs", 48))
