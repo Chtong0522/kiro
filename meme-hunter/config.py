@@ -144,9 +144,9 @@ TIER_B_SIZE_NIGHT  = 3
 TIER_B_STAGE       = "MIGRATED"
 TIER_B_MAX_AGE_MIN = 60            # V7: 120min -> 60min (只要最新鲜的)
 
-TIER_B_MC_MIN      = 50_000
+TIER_B_MC_MIN      = 80_000        # V7.1: $50K -> $80K (过滤太小的垃圾币)
 TIER_B_MC_MAX      = 500_000
-TIER_B_HOLDERS_MIN = 100
+TIER_B_HOLDERS_MIN = 150           # V7.1: 100 -> 150 (需要更多人参与)
 TIER_B_DEV_SOLD    = True
 TIER_B_INSIDERS_MAX = 15.0
 TIER_B_TOP10_MAX   = 40.0
@@ -190,6 +190,10 @@ VOLUME_CONFIRM_ENABLED = True
 VOLUME_5M_MIN_USD      = 8_000     # 5min最低成交量 $8K
 VOLUME_BUY_SELL_RATIO  = 1.2       # 买/卖比 >= 1.2
 VOLUME_TREND_CHECK     = True      # 检查成交量趋势 (递增=好)
+
+# V7.1: Pre-trade holder sell pressure detection
+HOLDER_SELL_CHECK_ENABLED = True   # 入场前检查 dev/sniper 是否在抛售
+HOLDER_SELL_MAX_SOL_5M    = 2.0    # 5min内 dev+sniper 卖出 > 2 SOL = 不买入
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAKE PROFIT / 止盈策略 (V7 重大改版!)

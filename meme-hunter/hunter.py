@@ -511,6 +511,16 @@ def check_volume_confirmation(addr, symbol="?"):
         if not bs_pass:
             return False, f"buy_sell_ratio={bs_ratio:.2f}<{config.VOLUME_BUY_SELL_RATIO}"
 
+        # V7.1: Check holder sell pressure (dev/sniper dumping)
+        sell_ok, sell_reason = check_holder_sell_pressure(addr, symbol)
+        if not sell_ok:
+            return False, sell_reason
+
+        # V7.1: Check momentum (not entering a dumping token)
+        mom_ok, mom_reason = check_momentum_signal(addr, symbol)
+        if not mom_ok:
+            return False, mom_reason
+
         return True, f"vol=${total_volume:.0f} green={green_count}/5 bs={bs_ratio:.1f}"
 
     except Exception:
@@ -540,6 +550,105 @@ def check_buy_sell_ratio(addr):
         return ratio, passes
     except Exception:
         return 1.0, True  # On error, pass
+
+
+def check_holder_sell_pressure(addr, symbol="?"):
+    """
+    V7.1: Pre-trade holder sell pressure check.
+    Detects if dev/insiders/snipers are CURRENTLY dumping before we enter.
+    This prevents buying into active rug pulls.
+    Returns (pass: bool, reason: str)
+    """
+    if not getattr(config, "HOLDER_SELL_CHECK_ENABLED", True):
+        return True, "disabled"
+
+    try:
+        # Check dev (tag=2) and sniper (tag=7) recent sells
+        now_ms = int(time.time() * 1000)
+        window_ms = 5 * 60 * 1000  # 5 minute window
+
+        total_sell_sol = 0.0
+        sell_details = []
+
+        for tag, label in [(2, "Dev"), (7, "Sniper")]:
+            data = onchainos_data("token", "trades",
+                                  "--chain", "solana",
+                                  "--address", addr,
+                                  "--tag-filter", str(tag),
+                                  "--limit", "20",
+                                  timeout=12)
+            if not isinstance(data, list):
+                continue
+
+            for trade in data:
+                if trade.get("type") != "sell":
+                    continue
+                ts = safe_int(trade.get("time", 0))
+                if ts <= 0 or (now_ms - ts) > window_ms:
+                    continue
+                # Extract SOL amount
+                sol_amt = 0.0
+                for tok_info in trade.get("changedTokenInfo", []):
+                    if tok_info.get("tokenSymbol") in ("SOL", "wSOL"):
+                        sol_amt = safe_float(tok_info.get("amount", 0))
+                        break
+                if sol_amt <= 0:
+                    sol_amt = safe_float(trade.get("volume", 0))
+                if sol_amt > 0:
+                    total_sell_sol += sol_amt
+                    sell_details.append(f"{label}:{sol_amt:.1f}SOL")
+
+        # Threshold: if dev+sniper sold > 2 SOL in last 5 min, too risky
+        max_sell_sol = getattr(config, "HOLDER_SELL_MAX_SOL_5M", 2.0)
+        if total_sell_sol > max_sell_sol:
+            detail = ", ".join(sell_details[:5])
+            return False, f"holder_selling={total_sell_sol:.1f}SOL>({max_sell_sol}) [{detail}]"
+
+        return True, f"sell_pressure={total_sell_sol:.1f}SOL(OK)"
+
+    except Exception:
+        return True, "check_error"
+
+
+def check_momentum_signal(addr, symbol="?"):
+    """
+    V7.1: Check if token has positive momentum indicators:
+    1. Price trending UP in recent candles (not already dumping)
+    2. Recent candle not all red (at least 2/5 green)
+    Returns (pass: bool, reason: str)
+    """
+    try:
+        data = onchainos_data("market", "candles",
+                              "--chain", "solana",
+                              "--address", addr,
+                              "--bar", "1m",
+                              timeout=12)
+        if not isinstance(data, list) or len(data) < 5:
+            return True, "insufficient_candle_data"
+
+        recent = data[-5:]
+
+        # Check: how many candles are green (close >= open)?
+        green_count = sum(1 for c in recent
+                         if safe_float(c.get("c", 0)) >= safe_float(c.get("o", 0)))
+
+        # If 4+ out of 5 candles are RED = token is dumping, don't enter
+        if green_count <= 1:
+            return False, f"dumping({green_count}/5 green)"
+
+        # Check: is the latest candle's close below the 5-candle open? (overall downtrend)
+        first_open = safe_float(recent[0].get("o", 0))
+        last_close = safe_float(recent[-1].get("c", 0))
+        if first_open > 0 and last_close > 0:
+            trend_pct = (last_close - first_open) / first_open * 100
+            # If price dropped more than 10% over last 5 minutes, skip
+            if trend_pct < -10:
+                return False, f"5m_downtrend={trend_pct:.1f}%"
+
+        return True, f"momentum_ok(green={green_count}/5)"
+
+    except Exception:
+        return True, "check_error"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1871,8 +1980,13 @@ def _exit_position(addr, pos, sell_ratio, reason, pnl_pct):
 # SECTION 13: Session Risk Control (V7: No Forced Shutdown!)
 # ══════════════════════════════════════════════════════════════════════════════
 
+_was_paused = False  # Track pause state for recovery logging
+
+
 def can_enter():
     """Check if opening new positions is allowed. Returns (ok, reason)."""
+    global _was_paused
+
     if config.PAUSED:
         return False, "PAUSED"
 
@@ -1885,7 +1999,12 @@ def can_enter():
     with state_lock:
         if time.time() < session_risk["paused_until"]:
             remain = int(session_risk["paused_until"] - time.time())
+            _was_paused = True
             return False, f"SESSION_PAUSED ({remain}s)"
+        elif _was_paused:
+            # Pause just expired — log recovery
+            _was_paused = False
+            feed(f"SESSION_RESUMED: pause expired, new entries allowed again")
 
     with pos_lock:
         active_count = sum(
