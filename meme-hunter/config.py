@@ -231,7 +231,7 @@ TIER_S_REFRESH_SEC  = 45       # Scan interval
 TIER_S_FOLLOW_TIERS = [1]      # Only follow Tier-1 wallets
 TIER_S_SAMPLE_SIZE  = 10       # Wallets sampled per cycle
 TIER_S_MAX_AGE_MIN  = 30       # Max age of wallet's buy (minutes)
-TIER_S_HOLDERS_MIN  = 150
+TIER_S_HOLDERS_MIN  = 250
 TIER_S_TOP10_MAX    = 40.0
 TIER_S_DEDUP_SEC    = 7200     # Skip same wallet+token for 2 hours
 
