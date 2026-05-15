@@ -324,12 +324,9 @@ def pre_trade_checks(addr, sym, quick=True):
         level = 4
 
     risk_lvl = _int_val(info, "riskControlLevel")
-    if risk_lvl >= 2:
-        reasons.append(f"G3: OKX_RISK_LEVEL={risk_lvl} (>=2 blocked)")
+    if risk_lvl >= 1:
+        reasons.append(f"G3: OKX_RISK_LEVEL={risk_lvl} (any risk blocked)")
         level = max(level, 3)
-    if risk_lvl >= 4:
-        reasons.append(f"G4: OKX_RISK_LEVEL={risk_lvl}")
-        level = 4
 
     # Selling velocity (full mode only)
     vel_sol_pm, vel_detail = (0.0, "") if quick else _selling_velocity(addr)
