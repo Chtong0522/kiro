@@ -368,6 +368,12 @@ def pre_trade_checks(addr, sym, quick=True):
         reasons.append(f"G3: SUSPICIOUS_WALLETS {suspicious_pct:.1f}% > 5%")
         level = max(level, 3)
 
+    # Phishing wallet count check (OKX tags suspicious addresses)
+    suspicious_count = _int_val(info, "suspiciousAddressCount")
+    if suspicious_count > 10:
+        reasons.append(f"G3: PHISHING_WALLETS {suspicious_count} > 10")
+        level = max(level, 3)
+
     # Wash trading (quick mode includes this — 1 extra API call)
     is_wash, wash_reason = _wash_trading_check(addr)
     if is_wash:
