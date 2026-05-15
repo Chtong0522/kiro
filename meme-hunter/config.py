@@ -285,7 +285,7 @@ TIER_D_TOP10_MAX     = 30.0
 TIER_D_RISK_LEVEL    = 1
 TIER_D_MIN_INFLOW    = 0
 TIER_D_MIN_CHANGE    = 0.0
-TIER_D_UNIQUE_TRADERS = 0
+TIER_D_UNIQUE_TRADERS = 100    # 至少100个独立交易者，防止少数人制造假活跃
 
 HOT_REFRESH_SEC      = 60     # Scan interval
 

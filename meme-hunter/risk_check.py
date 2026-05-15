@@ -359,13 +359,13 @@ def pre_trade_checks(addr, sym, quick=True):
         level = max(level, 3)
 
     sniper_pct = _pct(info, "sniperHoldingPercent")
-    if sniper_pct > 15:
-        reasons.append(f"G3: SNIPERS {sniper_pct:.1f}% > 15%")
+    if sniper_pct > 10:
+        reasons.append(f"G3: SNIPERS {sniper_pct:.1f}% > 10%")
         level = max(level, 3)
 
     suspicious_pct = _pct(info, "suspiciousHoldingPercent")
-    if suspicious_pct > 10:
-        reasons.append(f"G3: SUSPICIOUS_WALLETS {suspicious_pct:.1f}%")
+    if suspicious_pct > 5:
+        reasons.append(f"G3: SUSPICIOUS_WALLETS {suspicious_pct:.1f}% > 5%")
         level = max(level, 3)
 
     # Wash trading (quick mode includes this — 1 extra API call)
