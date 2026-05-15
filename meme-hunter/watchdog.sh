@@ -1,144 +1,142 @@
 #!/bin/bash
-# SOL Meme Hunter v7.0 - Watchdog Auto-Restart
-# 
-# 功能:
-#   - 每30秒检查 meme-hunter screen 是否还在运行
-#   - 如果挂了/断连/崩溃 → 自动重启
-#   - 自动拉取最新代码
-#   - 重启后记录日志
+# ══════════════════════════════════════════════════════════════════════════════
+# SOL Meme Hunter v8.0 — Watchdog Auto-Restart
 #
-# 使用方法:
-#   # 后台运行 watchdog (用独立 screen)
+# Features:
+#   - Checks bot health every 30 seconds
+#   - Auto-restarts on crash/disconnect
+#   - Pulls latest code from git before restart
+#   - Health logging every 10 minutes
+#   - Max restart limit with 24h reset (prevents infinite crash loops)
+#   - Cooldown between restarts
+#
+# Usage:
 #   screen -dmS watchdog bash ~/meme-hunter/watchdog.sh
 #
-#   # 查看 watchdog 日志
+# Monitor:
 #   tail -f /tmp/watchdog.log
 #
-#   # 停止 watchdog
+# Stop:
 #   screen -X -S watchdog quit
 #
-# 一键启动 watchdog + bot:
-#   screen -dmS watchdog bash ~/meme-hunter/watchdog.sh && echo "Watchdog started"
+# One-liner (start watchdog + bot):
+#   screen -dmS watchdog bash ~/meme-hunter/watchdog.sh && echo "OK"
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ── 配置 ────────────────────────────────────────────────────────────────────
+# ── Configuration ─────────────────────────────────────────────────────────────
 BOT_SESSION="meme-hunter"
 HUNTER_SCRIPT="$HOME/meme-hunter/hunter.py"
 KIRO_DIR="$HOME/kiro"
 MEME_DIR="$HOME/meme-hunter"
-LOG_FILE="/tmp/watchdog.log"
-BOT_LOG="/tmp/meme_hunter_v7.log"
-CHECK_INTERVAL=30       # 每30秒检查一次
-MAX_RESTARTS=20         # 24h内最大重启次数 (防止无限循环崩溃)
-RESTART_COOLDOWN=60     # 重启后等待60秒再检查
+LOG="/tmp/watchdog.log"
+BOT_LOG="/tmp/meme_hunter_v8.log"
+CHECK_INTERVAL=30       # Check every 30s
+MAX_RESTARTS=20         # Max restarts per 24h window
+RESTART_COOLDOWN=60     # Wait 60s between restarts
+HEALTH_LOG_INTERVAL=600 # Log health every 10min
 
-# ── 辅助函数 ─────────────────────────────────────────────────────────────────
+# ── Functions ─────────────────────────────────────────────────────────────────
 log() {
-    local ts=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$ts] $1" | tee -a "$LOG_FILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG"
 }
 
-is_bot_running() {
+is_running() {
     screen -list 2>/dev/null | grep -q "$BOT_SESSION"
 }
 
-restart_bot() {
-    log "=== RESTARTING BOT (attempt #$restart_count) ==="
+pull_latest() {
+    if [ -d "$KIRO_DIR/.git" ]; then
+        log "  Pulling latest code..."
+        if (cd "$KIRO_DIR" && git pull -q 2>/dev/null); then
+            # Copy updated files
+            for f in hunter.py config.py risk_check.py dashboard.html; do
+                [ -f "$KIRO_DIR/meme-hunter/$f" ] && cp "$KIRO_DIR/meme-hunter/$f" "$MEME_DIR/"
+            done
+            log "  Code updated"
+        else
+            log "  Git pull failed, using existing code"
+        fi
+    fi
+}
 
-    # 1. 停掉旧 session (如果还在)
+restart_bot() {
+    log "=== RESTART #$restart_count ==="
+
+    # Stop old session
     screen -X -S "$BOT_SESSION" quit 2>/dev/null
     sleep 2
 
-    # 2. 拉取最新代码
-    if [ -d "$KIRO_DIR" ]; then
-        log "  Pulling latest code from GitHub..."
-        cd "$KIRO_DIR" && git pull -q 2>/dev/null && \
-            cp meme-hunter/hunter.py "$MEME_DIR/" && \
-            cp meme-hunter/config.py "$MEME_DIR/" && \
-            cp meme-hunter/risk_check.py "$MEME_DIR/" && \
-            log "  Code updated OK" || \
-            log "  Git pull failed, using existing code"
-    fi
+    # Pull latest
+    pull_latest
 
-    # 3. 启动新 session
+    # Start new session
     screen -dmS "$BOT_SESSION" python3 "$HUNTER_SCRIPT"
     sleep 3
 
-    # 4. 验证是否启动成功
-    if is_bot_running; then
-        log "  Bot restarted successfully (session: $BOT_SESSION)"
+    if is_running; then
+        log "  Restart successful"
         return 0
     else
-        log "  ERROR: Bot failed to start!"
+        log "  ERROR: Restart failed!"
         return 1
     fi
 }
 
-# ── 主循环 ───────────────────────────────────────────────────────────────────
-log "============================================"
-log "  Watchdog started for SOL Meme Hunter v7.0"
-log "  Check interval: ${CHECK_INTERVAL}s"
-log "  Max restarts: $MAX_RESTARTS"
-log "  Bot script: $HUNTER_SCRIPT"
-log "============================================"
+# ── Main Loop ─────────────────────────────────────────────────────────────────
+log "════════════════════════════════════════════════"
+log "  Watchdog v8.0 started"
+log "  Bot: $HUNTER_SCRIPT"
+log "  Check: every ${CHECK_INTERVAL}s"
+log "  Max restarts: $MAX_RESTARTS/24h"
+log "════════════════════════════════════════════════"
 
 restart_count=0
 last_restart_ts=0
-consecutive_failures=0
+last_health_ts=0
 
 while true; do
     sleep "$CHECK_INTERVAL"
+    now=$(date '+%s')
 
-    if is_bot_running; then
-        # Bot is alive — 重置连续失败计数
-        consecutive_failures=0
-
-        # 每10分钟记录一次 alive 状态
-        minute=$(date '+%M')
-        if [ "$minute" = "00" ] || [ "$minute" = "10" ] || [ "$minute" = "20" ] || \
-           [ "$minute" = "30" ] || [ "$minute" = "40" ] || [ "$minute" = "50" ]; then
-            # 从日志提取最后的余额行
-            last_balance=$(grep "SOL:" "$BOT_LOG" 2>/dev/null | tail -1)
-            log "  ALIVE | $last_balance"
+    if is_running; then
+        # Bot alive — log health periodically
+        if [ $((now - last_health_ts)) -ge $HEALTH_LOG_INTERVAL ]; then
+            last_health_ts=$now
+            last_line=$(grep "SOL:" "$BOT_LOG" 2>/dev/null | tail -1)
+            log "  ALIVE | $last_line"
         fi
         continue
     fi
 
-    # Bot is NOT running
-    log "  ALERT: Bot is not running! (consecutive_failures=$consecutive_failures)"
-    consecutive_failures=$((consecutive_failures + 1))
+    # Bot is DOWN
+    log "  ALERT: Bot not running!"
 
-    # 检查重启次数限制
+    # Check restart limit
     if [ "$restart_count" -ge "$MAX_RESTARTS" ]; then
-        # 重置计数器 (超过上限后每小时重置，允许继续重启)
-        now_ts=$(date '+%s')
-        hours_since=$((($now_ts - $last_restart_ts) / 3600))
+        hours_since=$(( (now - last_restart_ts) / 3600 ))
         if [ "$hours_since" -ge 24 ]; then
-            log "  Resetting restart counter after 24h"
+            log "  Reset restart counter (24h elapsed)"
             restart_count=0
         else
-            log "  WARNING: Max restarts ($MAX_RESTARTS) reached. Waiting for 24h reset."
-            sleep 300   # 等5分钟再检查
+            log "  Max restarts reached. Waiting for 24h reset."
+            sleep 300
             continue
         fi
     fi
 
-    # 等待冷却时间（避免启动失败后立即重试）
-    now_ts=$(date '+%s')
-    secs_since=$(($now_ts - $last_restart_ts))
+    # Cooldown
+    secs_since=$((now - last_restart_ts))
     if [ "$secs_since" -lt "$RESTART_COOLDOWN" ] && [ "$last_restart_ts" -gt 0 ]; then
-        wait_time=$(($RESTART_COOLDOWN - $secs_since))
-        log "  Cooldown: waiting ${wait_time}s before restart..."
-        sleep "$wait_time"
+        wait=$((RESTART_COOLDOWN - secs_since))
+        log "  Cooldown: ${wait}s..."
+        sleep "$wait"
     fi
 
-    # 重启
+    # Restart
     restart_count=$((restart_count + 1))
     last_restart_ts=$(date '+%s')
 
     if restart_bot; then
-        log "  Restart #$restart_count successful. Sleeping ${RESTART_COOLDOWN}s..."
         sleep "$RESTART_COOLDOWN"
-    else
-        log "  Restart #$restart_count FAILED. Will retry in ${CHECK_INTERVAL}s"
     fi
 done

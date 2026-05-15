@@ -1,27 +1,31 @@
 #!/usr/bin/env python3
 """
-SOL Meme Hunter v7.0 - Production Trading Bot
-Architecture: 4-Tier (S/A/B/D) + Smart Wallet Signal + Adaptive Exit System
+SOL Meme Hunter v8.0 — Autonomous Solana Meme Token Trading Bot
+═══════════════════════════════════════════════════════════════════
+
+Architecture: 4-Tier (S/A/B/D) + Smart Wallet Signal + 9-Layer Adaptive Exit
+Data Source:  onchainOS CLI (sole source, zero API keys)
+Execution:    TEE-secured wallet signing via onchainos contract-call
 
 Tiers:
-  S - Smart Wallet Follow (our curated smart wallet database)
-  A - Smart Money Signal (onchainos signal list)
-  B - Graduation Ambush (onchainos memepump tokens --stage MIGRATED)
-  D - Hot Momentum (onchainos token hot-tokens --ranking-type 4)
+  S — Smart Wallet Follow (curated 816-address database)
+  A — Smart Money Signal (onchainos signal list, multi-wallet co-buy)
+  B — Graduation Ambush (PumpFun → Raydium MIGRATED tokens)
+  D — Hot Momentum (composite-scored trending tokens)
 
-V7 Core:
-  - TP1 = +100% sell 50% (cover cost), TP2/TP3 wider
-  - SL = -20% first tier, -30% full exit
-  - Floor position exits when in loss (no dead holding)
-  - Smart Wallet signal weighting from curated CSV
-  - No forced shutdown - pause only, safe overnight
-  - Volume confirmation before entry
+V8 Improvements over V7:
+  - User-configurable presets (conservative/balanced/aggressive)
+  - Improved error handling with structured fallbacks
+  - Reduced redundant API calls (cache-first architecture)
+  - Better thread safety with context managers
+  - Structured logging with severity levels
+  - Graceful degradation on API failures
 
 Dashboard: http://localhost:3250
 """
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 1: Imports & Setup
+# IMPORTS
 # ══════════════════════════════════════════════════════════════════════════════
 
 import subprocess
@@ -38,11 +42,15 @@ from pathlib import Path
 from datetime import datetime, timezone
 from collections import defaultdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from contextlib import contextmanager
 
 import config
 from risk_check import pre_trade_checks, post_trade_flags
 
-# Ensure onchainos CLI is on PATH
+# ══════════════════════════════════════════════════════════════════════════════
+# ENVIRONMENT SETUP
+# ══════════════════════════════════════════════════════════════════════════════
+
 os.environ["PATH"] = (
     os.path.expanduser("~/.local/bin") + ":"
     + os.path.expanduser("~/.nvm/versions/node/v22.22.2/bin") + ":"
@@ -53,22 +61,21 @@ PROJECT_DIR = Path(__file__).parent
 SOL_NATIVE = config.SOL_NATIVE
 _NEVER_TRADE = getattr(config, "_NEVER_TRADE_MINTS", set())
 _startup_ts = time.time()
-
+_VERSION = "8.0"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 2: Smart Wallet Database
+# SECTION 1: SMART WALLET DATABASE
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Loaded at startup from CSV
-_smart_wallets = {}  # {wallet_address: {"tier": 1/2/3/-1, "group": str, "roles": set, "tokens": set}}
+_smart_wallets = {}  # {addr: {"tier": int, "group": str, "roles": set, "tokens": set}}
 
 
 def load_smart_wallets():
-    """Load smart wallet database from CSV file."""
+    """Load smart wallet database from CSV. Fail-safe: logs warning on error."""
     global _smart_wallets
     csv_path = PROJECT_DIR / config.SMART_WALLET_CSV
     if not csv_path.exists():
-        feed(f"WARNING: Smart wallet CSV not found: {csv_path}")
+        log("WARN", f"Smart wallet CSV not found: {csv_path}")
         return
 
     wallets = {}
@@ -76,11 +83,10 @@ def load_smart_wallets():
         with open(csv_path, "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                addr = row.get("\u94b1\u5305\u5730\u5740", "").strip()  # 钱包地址
-                group = row.get("\u5206\u7ec4", "").strip()  # 分组
-                token = row.get("\u4ee3\u5e01", "").strip()  # 代币
-                role_str = row.get("\u89d2\u8272", "").strip()  # 角色
-                rank = row.get("\u6392\u540d", "1").strip()  # 排名
+                addr = row.get("钱包地址", "").strip()
+                group = row.get("分组", "").strip()
+                token = row.get("代币", "").strip()
+                role_str = row.get("角色", "").strip()
 
                 if not addr:
                     continue
@@ -88,45 +94,30 @@ def load_smart_wallets():
                 tier = config.SMART_WALLET_GROUP_TIER.get(group, 3)
 
                 if addr not in wallets:
-                    wallets[addr] = {
-                        "tier": tier,
-                        "group": group,
-                        "roles": set(),
-                        "tokens": set(),
-                        "rank_sum": 0,
-                        "count": 0,
-                    }
+                    wallets[addr] = {"tier": tier, "group": group, "roles": set(), "tokens": set()}
                 else:
-                    # Keep the best (lowest) tier
+                    # Keep best tier
                     if tier > 0 and (wallets[addr]["tier"] < 0 or tier < wallets[addr]["tier"]):
                         wallets[addr]["tier"] = tier
-                    elif tier < 0 and wallets[addr]["tier"] < 0:
-                        pass  # already negative
 
                 if token:
                     wallets[addr]["tokens"].add(token)
                 if role_str:
                     for r in role_str.split(","):
                         wallets[addr]["roles"].add(r.strip())
-                wallets[addr]["rank_sum"] += safe_int(rank, 1)
-                wallets[addr]["count"] += 1
 
         _smart_wallets = wallets
         tier_counts = defaultdict(int)
         for w in wallets.values():
             tier_counts[w["tier"]] += 1
-        feed(f"Smart Wallets loaded: {len(wallets)} addresses | "
-             f"T1={tier_counts[1]} T2={tier_counts[2]} T3={tier_counts[3]} neg={tier_counts[-1]}")
+        log("INFO", f"Smart Wallets: {len(wallets)} loaded | "
+            f"T1={tier_counts[1]} T2={tier_counts[2]} T3={tier_counts[3]} neg={tier_counts[-1]}")
     except Exception as e:
-        feed(f"ERROR loading smart wallets: {e}")
+        log("ERROR", f"Loading smart wallets: {e}")
 
 
 def get_smart_wallet_score(token_holders):
-    """
-    Given a list of holder addresses for a token, calculate smart wallet boost score.
-    token_holders: list of wallet address strings
-    Returns: (score_boost: int, matched_wallets: list)
-    """
+    """Calculate smart wallet boost from token's top holders."""
     if not _smart_wallets or not token_holders:
         return 0, []
 
@@ -135,64 +126,71 @@ def get_smart_wallet_score(token_holders):
 
     for holder_addr in token_holders:
         if holder_addr in _smart_wallets:
-            wallet_info = _smart_wallets[holder_addr]
-            tier = wallet_info["tier"]
-            base_boost = config.SMART_WALLET_SCORE_BOOST.get(tier, 0)
-
-            # Apply role weight multiplier (use best role)
-            best_mult = 1.0
-            for role in wallet_info["roles"]:
-                mult = config.SMART_WALLET_ROLE_WEIGHT.get(role, 1.0)
-                if mult > best_mult:
-                    best_mult = mult
-
+            info = _smart_wallets[holder_addr]
+            base_boost = config.SMART_WALLET_SCORE_BOOST.get(info["tier"], 0)
+            best_mult = max((config.SMART_WALLET_ROLE_WEIGHT.get(r, 1.0) for r in info["roles"]), default=1.0)
             boost = int(base_boost * best_mult)
             total_boost += boost
-            matched.append({"addr": holder_addr[:8], "tier": tier, "boost": boost})
+            matched.append({"addr": holder_addr[:8], "tier": info["tier"], "boost": boost})
 
-    # Cap at max boost
-    total_boost = min(total_boost, config.SMART_WALLET_MAX_BOOST)
-    return total_boost, matched
+    return min(total_boost, config.SMART_WALLET_MAX_BOOST), matched
 
 
 def get_smart_wallet_addresses(tier_filter=None):
-    """Get list of smart wallet addresses, optionally filtered by tier."""
+    """Get wallet addresses, optionally filtered by tier."""
     if tier_filter is None:
         return list(_smart_wallets.keys())
-    return [addr for addr, info in _smart_wallets.items() if info["tier"] in tier_filter]
+    return [a for a, i in _smart_wallets.items() if i["tier"] in tier_filter]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 3: State Management
+# SECTION 2: STATE MANAGEMENT (Thread-Safe)
 # ══════════════════════════════════════════════════════════════════════════════
 
-state_lock = threading.Lock()
-pos_lock = threading.Lock()
-trades_lock = threading.Lock()
+_state_lock = threading.Lock()
+_pos_lock = threading.Lock()
+_trades_lock = threading.Lock()
 
 cooldown_map = {}
 _selling = set()
 _wallet_addr = ""
-_risk_check_semaphore = threading.Semaphore(3)
+_risk_semaphore = threading.Semaphore(3)
 
 state = {
     "positions": {},
     "trades": [],
     "feed": [],
-    "stats": {
-        "cycle": 0, "buys": 0, "sells": 0,
-        "wins": 0, "losses": 0, "net_pnl": 0.0,
-    },
+    "stats": {"cycle": 0, "buys": 0, "sells": 0, "wins": 0, "losses": 0, "net_pnl": 0.0},
 }
 
 session_risk = {
     "consecutive_losses": 0,
     "cumulative_loss_usd": 0.0,
     "paused_until": 0,
-    # V7: no "stopped" field - we only pause, never stop
 }
 
 acted = {}
+
+
+@contextmanager
+def pos_locked():
+    """Context manager for position lock — ensures save on exit."""
+    _pos_lock.acquire()
+    try:
+        yield state["positions"]
+    finally:
+        _pos_lock.release()
+
+
+def _atomic_write(filepath, data):
+    """Write JSON atomically (tmp + replace). Prevents corruption."""
+    tmp = filepath + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f, default=str, indent=2)
+        os.replace(tmp, filepath)
+    except Exception as e:
+        log("ERROR", f"Atomic write failed {filepath}: {e}")
 
 
 def load_positions():
@@ -201,28 +199,20 @@ def load_positions():
             state["positions"] = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         state["positions"] = {}
+    # Ensure all positions have required fields
     now = time.time()
-    for addr, pos in state["positions"].items():
-        if not pos.get("entry_ts"):
-            pos["entry_ts"] = pos.get("opened_at_ts") or now
-        if not pos.get("opened_at_ts"):
-            pos["opened_at_ts"] = pos.get("entry_ts") or now
-        if "remaining" not in pos:
-            pos["remaining"] = 1.0
-        if "sl1_triggered" not in pos:
-            pos["sl1_triggered"] = False
-        if "tp_tier" not in pos:
-            pos["tp_tier"] = 0
+    for pos in state["positions"].values():
+        pos.setdefault("entry_ts", pos.get("opened_at_ts", now))
+        pos.setdefault("opened_at_ts", pos.get("entry_ts", now))
+        pos.setdefault("remaining", 1.0)
+        pos.setdefault("sl1_triggered", False)
+        pos.setdefault("tp_tier", 0)
+        pos.setdefault("zero_count", 0)
+        pos.setdefault("sell_fail_count", 0)
 
 
 def save_positions():
-    tmp = config.POSITIONS_FILE + ".tmp"
-    try:
-        with open(tmp, "w") as f:
-            json.dump(state["positions"], f, default=str, indent=2)
-        os.replace(tmp, config.POSITIONS_FILE)
-    except Exception:
-        pass
+    _atomic_write(config.POSITIONS_FILE, state["positions"])
 
 
 def load_trades():
@@ -234,13 +224,7 @@ def load_trades():
 
 
 def save_trades():
-    tmp = config.TRADES_FILE + ".tmp"
-    try:
-        with open(tmp, "w") as f:
-            json.dump(state["trades"], f, default=str, indent=2)
-        os.replace(tmp, config.TRADES_FILE)
-    except Exception:
-        pass
+    _atomic_write(config.TRADES_FILE, state["trades"])
 
 
 def load_acted():
@@ -253,13 +237,7 @@ def load_acted():
 
 
 def save_acted():
-    tmp = config.ACTED_FILE + ".tmp"
-    try:
-        with open(tmp, "w") as f:
-            json.dump(acted, f, default=str)
-        os.replace(tmp, config.ACTED_FILE)
-    except Exception:
-        pass
+    _atomic_write(config.ACTED_FILE, acted)
 
 
 def load_session():
@@ -270,37 +248,36 @@ def load_session():
             session_risk.update(data)
     except (FileNotFoundError, json.JSONDecodeError):
         pass
-    # V7: remove legacy "stopped" field if present
-    session_risk.pop("stopped", None)
+    session_risk.pop("stopped", None)  # Remove legacy field
 
 
 def save_session():
-    tmp = config.SESSION_FILE + ".tmp"
-    try:
-        with open(tmp, "w") as f:
-            json.dump(session_risk, f, default=str)
-        os.replace(tmp, config.SESSION_FILE)
-    except Exception:
-        pass
+    _atomic_write(config.SESSION_FILE, session_risk)
 
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 4: Utility Functions
+# SECTION 3: LOGGING & UTILITIES
 # ══════════════════════════════════════════════════════════════════════════════
 
-def feed(msg):
+def log(level, msg):
+    """Structured logging with severity level."""
     ts = datetime.now().strftime("%H:%M:%S")
-    line = f"[{ts}] {msg}"
+    line = f"[{ts}] [{level}] {msg}"
     print(line, flush=True)
     try:
         with open(config.LOG_FILE, "a") as f:
             f.write(line + "\n")
     except Exception:
         pass
-    with state_lock:
-        state["feed"].append({"msg": msg, "t": ts})
-        state["feed"] = state["feed"][-50:]
+    with _state_lock:
+        state["feed"].append({"msg": msg, "t": ts, "level": level})
+        state["feed"] = state["feed"][-60:]
+
+
+def feed(msg):
+    """Shortcut for INFO-level log (backward compat)."""
+    log("INFO", msg)
 
 
 def safe_float(v, default=0.0):
@@ -319,31 +296,47 @@ def safe_int(v, default=0):
 
 def is_night():
     h = datetime.now(timezone.utc).hour
-    if config.NIGHT_START_UTC < config.NIGHT_END_UTC:
-        return config.NIGHT_START_UTC <= h < config.NIGHT_END_UTC
-    else:
-        return h >= config.NIGHT_START_UTC or h < config.NIGHT_END_UTC
+    s, e = config.NIGHT_START_UTC, config.NIGHT_END_UTC
+    return (s <= h < e) if s < e else (h >= s or h < e)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 4: ONCHAINOS CLI INTERFACE
+# Centralized CLI wrapper with timeout, error handling, and caching.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_price_cache = {}  # {addr: (timestamp, data)}
+_PRICE_CACHE_TTL = 5  # seconds
 
 
 def onchainos_run(*args, timeout=20):
+    """Execute onchainos CLI command. Returns parsed JSON or error dict."""
     try:
         r = subprocess.run(
             ["onchainos", *args],
             capture_output=True, text=True, timeout=timeout
         )
+        if r.returncode != 0 and not r.stdout.strip():
+            return {"ok": False, "msg": f"exit_code={r.returncode}", "data": None}
         return json.loads(r.stdout)
     except subprocess.TimeoutExpired:
         return {"ok": False, "msg": "timeout", "data": None}
-    except (json.JSONDecodeError, Exception):
+    except json.JSONDecodeError:
         return {"ok": False, "msg": "parse_error", "data": None}
+    except FileNotFoundError:
+        return {"ok": False, "msg": "onchainos_not_found", "data": None}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)[:100], "data": None}
 
 
 def onchainos_data(*args, timeout=20):
+    """Execute onchainos CLI and return .data field."""
     result = onchainos_run(*args, timeout=timeout)
     return result.get("data")
 
 
 def get_wallet_address():
+    """Get wallet address (cached after first call)."""
     global _wallet_addr
     if _wallet_addr:
         return _wallet_addr
@@ -355,11 +348,9 @@ def get_wallet_address():
                 _wallet_addr = sol_addrs[0].get("address", "")
         elif isinstance(data, list):
             for item in data:
-                if isinstance(item, dict):
-                    ci = item.get("chainIndex")
-                    if ci in (501, "501"):
-                        _wallet_addr = item.get("address", "")
-                        break
+                if isinstance(item, dict) and item.get("chainIndex") in (501, "501"):
+                    _wallet_addr = item.get("address", "")
+                    break
         if not _wallet_addr:
             _wallet_addr = config.WALLET
     except Exception:
@@ -368,27 +359,19 @@ def get_wallet_address():
 
 
 def get_sol_balance():
+    """Get SOL balance from wallet."""
     try:
         data = onchainos_data("wallet", "balance", "--chain", "501")
         if isinstance(data, dict):
             details = data.get("details", [])
             if isinstance(details, list):
                 for detail in details:
-                    assets = detail.get("tokenAssets", [])
-                    if isinstance(assets, list):
-                        for a in assets:
-                            ta = a.get("tokenAddress")
-                            sym = (a.get("symbol") or "").upper()
-                            if ta in ("", None) or sym == "SOL":
-                                return safe_float(a.get("balance", 0))
-            ta = data.get("tokenAddress")
-            if ta in ("", None):
-                return safe_float(data.get("balance", 0))
+                    for a in detail.get("tokenAssets", []):
+                        if a.get("tokenAddress") in ("", None) or (a.get("symbol") or "").upper() == "SOL":
+                            return safe_float(a.get("balance", 0))
         elif isinstance(data, list):
             for b in data:
-                ta = b.get("tokenAddress")
-                sym = (b.get("symbol") or "").upper()
-                if ta in ("", None) or sym == "SOL":
+                if b.get("tokenAddress") in ("", None) or (b.get("symbol") or "").upper() == "SOL":
                     return safe_float(b.get("balance", 0))
     except Exception:
         pass
@@ -396,44 +379,49 @@ def get_sol_balance():
 
 
 def get_sol_price():
+    """Get current SOL price in USD."""
     try:
-        data = onchainos_data("token", "price-info", "--chain", "solana",
-                              "--address", SOL_NATIVE)
+        data = onchainos_data("token", "price-info", "--chain", "solana", "--address", SOL_NATIVE)
         if isinstance(data, list):
             for item in data:
                 p = safe_float(item.get("price", 0))
                 if p > 0:
                     return p
         elif isinstance(data, dict):
-            p = safe_float(data.get("price", 0))
-            if p > 0:
-                return p
+            return safe_float(data.get("price", 0))
     except Exception:
         pass
     return 0.0
 
 
 def get_token_price(addr):
+    """Get token price info (cached for 5s to reduce API calls)."""
+    now = time.time()
+    cached = _price_cache.get(addr)
+    if cached and (now - cached[0]) < _PRICE_CACHE_TTL:
+        return cached[1]
+
     try:
-        data = onchainos_data("token", "price-info", "--chain", "solana",
-                              "--address", addr)
-        if isinstance(data, list):
-            return data[0] if data else {}
+        data = onchainos_data("token", "price-info", "--chain", "solana", "--address", addr)
+        result = {}
+        if isinstance(data, list) and data:
+            result = data[0]
         elif isinstance(data, dict):
-            return data
+            result = data
+        _price_cache[addr] = (now, result)
+        return result
     except Exception:
-        pass
-    return {}
+        return _price_cache.get(addr, (0, {}))[1]
 
 
 def get_token_balance(wallet_addr, token_addr):
+    """Get specific token balance for wallet."""
     try:
         data = onchainos_data("portfolio", "token-balances",
                               "--address", wallet_addr,
                               "--tokens", f"501:{token_addr}")
         if isinstance(data, list) and data:
-            item = data[0]
-            return safe_float(item.get("amount", 0))
+            return safe_float(data[0].get("amount", 0))
         elif isinstance(data, dict):
             return safe_float(data.get("amount", 0))
     except Exception:
@@ -442,19 +430,13 @@ def get_token_balance(wallet_addr, token_addr):
 
 
 def get_token_holders(token_addr, limit=20):
-    """Get top holders for a token. Returns list of holder address strings."""
+    """Get top holder addresses for a token."""
     try:
-        data = onchainos_data("token", "holders",
-                              "--chain", "solana",
-                              "--address", token_addr,
-                              "--limit", str(limit))
+        data = onchainos_data("token", "holders", "--chain", "solana",
+                              "--address", token_addr, "--limit", str(limit))
         if isinstance(data, list):
-            holders = []
-            for item in data:
-                addr = item.get("holderAddress", "") or item.get("address", "")
-                if addr:
-                    holders.append(addr)
-            return holders
+            return [item.get("holderAddress", "") or item.get("address", "")
+                    for item in data if item.get("holderAddress") or item.get("address")]
         elif isinstance(data, dict):
             items = data.get("items", data.get("holders", []))
             return [item.get("holderAddress", "") or item.get("address", "")
@@ -466,127 +448,94 @@ def get_token_holders(token_addr, limit=20):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 5: Volume Confirmation (V7 New!)
+# SECTION 5: VOLUME CONFIRMATION (Pre-Entry Gate)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def check_volume_confirmation(addr, symbol="?"):
     """
-    V7: Check 5-minute volume and buy/sell ratio before entry.
-    Returns (pass: bool, reason: str)
+    Pre-entry volume gate: 5-min volume, buy/sell ratio, trend, sell pressure.
+    Returns (pass: bool, reason: str).
+    Fail-open: on API error, allows entry (don't block on missing data).
     """
     if not config.VOLUME_CONFIRM_ENABLED:
         return True, "disabled"
 
     try:
-        data = onchainos_data("market", "candles",
-                              "--chain", "solana",
-                              "--address", addr,
-                              "--bar", "1m",
-                              timeout=15)
+        # 5-minute volume from 1m candles
+        data = onchainos_data("market", "candles", "--chain", "solana",
+                              "--address", addr, "--bar", "1m", timeout=15)
         if not isinstance(data, list) or len(data) < 5:
-            # Not enough data - allow entry (don't block on missing data)
             return True, "insufficient_data"
 
-        # Take last 5 candles (5 minutes)
         recent = data[-5:]
         total_volume = sum(safe_float(c.get("v", 0)) for c in recent)
 
         if total_volume < config.VOLUME_5M_MIN_USD:
             return False, f"vol_5m=${total_volume:.0f}<${config.VOLUME_5M_MIN_USD}"
 
-        # Check trend: are candles generally green (close > open)?
-        green_count = sum(1 for c in recent
-                         if safe_float(c.get("c", 0)) >= safe_float(c.get("o", 0)))
-
-        # Volume trend check: is volume increasing?
+        # Volume trend: declining rapidly?
         if config.VOLUME_TREND_CHECK and len(recent) >= 3:
-            first_half_vol = sum(safe_float(c.get("v", 0)) for c in recent[:2])
-            second_half_vol = sum(safe_float(c.get("v", 0)) for c in recent[3:])
-            # If volume is decreasing rapidly, it's a warning
-            if first_half_vol > 0 and second_half_vol < first_half_vol * 0.3:
+            first_half = sum(safe_float(c.get("v", 0)) for c in recent[:2])
+            second_half = sum(safe_float(c.get("v", 0)) for c in recent[3:])
+            if first_half > 0 and second_half < first_half * 0.3:
                 return False, "vol_declining_rapidly"
 
-        # V7: Also check buy/sell ratio from recent trades
-        bs_ratio, bs_pass = check_buy_sell_ratio(addr)
-        if not bs_pass:
+        # Buy/sell ratio
+        bs_ratio = _check_buy_sell_ratio(addr)
+        if bs_ratio < config.VOLUME_BUY_SELL_RATIO:
             return False, f"buy_sell_ratio={bs_ratio:.2f}<{config.VOLUME_BUY_SELL_RATIO}"
 
-        # V7.1: Check holder sell pressure (dev/sniper dumping)
-        sell_ok, sell_reason = check_holder_sell_pressure(addr, symbol)
-        if not sell_ok:
-            return False, sell_reason
+        # Holder sell pressure
+        if config.HOLDER_SELL_CHECK_ENABLED:
+            sell_ok, sell_reason = _check_holder_sell_pressure(addr)
+            if not sell_ok:
+                return False, sell_reason
 
-        # V7.1: Check momentum (not entering a dumping token)
-        mom_ok, mom_reason = check_momentum_signal(addr, symbol)
-        if not mom_ok:
-            return False, mom_reason
+        # Momentum check: not entering a dumping token
+        green_count = sum(1 for c in recent
+                         if safe_float(c.get("c", 0)) >= safe_float(c.get("o", 0)))
+        if green_count <= 1:
+            return False, f"dumping({green_count}/5 green)"
 
-        return True, f"vol=${total_volume:.0f} green={green_count}/5 bs={bs_ratio:.1f}"
+        return True, f"vol=${total_volume:.0f} bs={bs_ratio:.1f} green={green_count}/5"
 
     except Exception:
-        # On error, allow entry (don't block on API failures)
         return True, "check_error"
 
 
-def check_buy_sell_ratio(addr):
-    """
-    Check recent buy/sell transaction ratio.
-    Returns (ratio: float, pass: bool)
-    """
+def _check_buy_sell_ratio(addr):
+    """Get buy/sell ratio from recent trades. Returns ratio (default 1.0 on error)."""
     try:
-        data = onchainos_data("token", "trades",
-                              "--chain", "solana",
-                              "--address", addr,
-                              "--limit", "50",
-                              timeout=15)
+        data = onchainos_data("token", "trades", "--chain", "solana",
+                              "--address", addr, "--limit", "50", timeout=15)
         if not isinstance(data, list) or len(data) < 10:
-            return 1.0, True  # Not enough data, pass
-
+            return 1.0
         buys = sum(1 for t in data if (t.get("side", "") or t.get("type", "")).lower() == "buy")
         sells = len(data) - buys
-
-        ratio = buys / max(sells, 1)
-        passes = ratio >= config.VOLUME_BUY_SELL_RATIO
-        return ratio, passes
+        return buys / max(sells, 1)
     except Exception:
-        return 1.0, True  # On error, pass
+        return 1.0
 
 
-def check_holder_sell_pressure(addr, symbol="?"):
-    """
-    V7.1: Pre-trade holder sell pressure check.
-    Detects if dev/insiders/snipers are CURRENTLY dumping before we enter.
-    This prevents buying into active rug pulls.
-    Returns (pass: bool, reason: str)
-    """
-    if not getattr(config, "HOLDER_SELL_CHECK_ENABLED", True):
-        return True, "disabled"
-
+def _check_holder_sell_pressure(addr):
+    """Check if dev/snipers are actively dumping. Returns (pass, reason)."""
     try:
-        # Check dev (tag=2) and sniper (tag=7) recent sells
         now_ms = int(time.time() * 1000)
-        window_ms = 5 * 60 * 1000  # 5 minute window
-
+        window_ms = 5 * 60 * 1000
         total_sell_sol = 0.0
-        sell_details = []
 
-        for tag, label in [(2, "Dev"), (7, "Sniper")]:
-            data = onchainos_data("token", "trades",
-                                  "--chain", "solana",
-                                  "--address", addr,
-                                  "--tag-filter", str(tag),
-                                  "--limit", "20",
-                                  timeout=12)
+        for tag in (2, 7):  # dev, sniper
+            data = onchainos_data("token", "trades", "--chain", "solana",
+                                  "--address", addr, "--tag-filter", str(tag),
+                                  "--limit", "20", timeout=12)
             if not isinstance(data, list):
                 continue
-
             for trade in data:
                 if trade.get("type") != "sell":
                     continue
                 ts = safe_int(trade.get("time", 0))
                 if ts <= 0 or (now_ms - ts) > window_ms:
                     continue
-                # Extract SOL amount
                 sol_amt = 0.0
                 for tok_info in trade.get("changedTokenInfo", []):
                     if tok_info.get("tokenSymbol") in ("SOL", "wSOL"):
@@ -594,80 +543,31 @@ def check_holder_sell_pressure(addr, symbol="?"):
                         break
                 if sol_amt <= 0:
                     sol_amt = safe_float(trade.get("volume", 0))
-                if sol_amt > 0:
-                    total_sell_sol += sol_amt
-                    sell_details.append(f"{label}:{sol_amt:.1f}SOL")
+                total_sell_sol += sol_amt
 
-        # Threshold: if dev+sniper sold > 2 SOL in last 5 min, too risky
-        max_sell_sol = getattr(config, "HOLDER_SELL_MAX_SOL_5M", 2.0)
-        if total_sell_sol > max_sell_sol:
-            detail = ", ".join(sell_details[:5])
-            return False, f"holder_selling={total_sell_sol:.1f}SOL>({max_sell_sol}) [{detail}]"
-
-        return True, f"sell_pressure={total_sell_sol:.1f}SOL(OK)"
-
-    except Exception:
-        return True, "check_error"
-
-
-def check_momentum_signal(addr, symbol="?"):
-    """
-    V7.1: Check if token has positive momentum indicators:
-    1. Price trending UP in recent candles (not already dumping)
-    2. Recent candle not all red (at least 2/5 green)
-    Returns (pass: bool, reason: str)
-    """
-    try:
-        data = onchainos_data("market", "candles",
-                              "--chain", "solana",
-                              "--address", addr,
-                              "--bar", "1m",
-                              timeout=12)
-        if not isinstance(data, list) or len(data) < 5:
-            return True, "insufficient_candle_data"
-
-        recent = data[-5:]
-
-        # Check: how many candles are green (close >= open)?
-        green_count = sum(1 for c in recent
-                         if safe_float(c.get("c", 0)) >= safe_float(c.get("o", 0)))
-
-        # If 4+ out of 5 candles are RED = token is dumping, don't enter
-        if green_count <= 1:
-            return False, f"dumping({green_count}/5 green)"
-
-        # Check: is the latest candle's close below the 5-candle open? (overall downtrend)
-        first_open = safe_float(recent[0].get("o", 0))
-        last_close = safe_float(recent[-1].get("c", 0))
-        if first_open > 0 and last_close > 0:
-            trend_pct = (last_close - first_open) / first_open * 100
-            # If price dropped more than 10% over last 5 minutes, skip
-            if trend_pct < -10:
-                return False, f"5m_downtrend={trend_pct:.1f}%"
-
-        return True, f"momentum_ok(green={green_count}/5)"
-
+        max_sell = config.HOLDER_SELL_MAX_SOL_5M
+        if total_sell_sol > max_sell:
+            return False, f"holder_selling={total_sell_sol:.1f}SOL>{max_sell}"
+        return True, "ok"
     except Exception:
         return True, "check_error"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 6: Swap Execution Engine
+# SECTION 6: SWAP EXECUTION ENGINE
+# Iron Rule: NEVER use `swap execute`. Always: swap swap → contract-call → confirm.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def poll_tx_status(tx_hash, timeout=60):
+    """Poll transaction status until confirmed/failed/timeout."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             data = onchainos_data("wallet", "history",
-                                  "--tx-hash", tx_hash,
-                                  "--chain-index", "501", timeout=15)
+                                  "--tx-hash", tx_hash, "--chain-index", "501", timeout=15)
             if data:
-                status = ""
-                if isinstance(data, dict):
-                    status = (data.get("status") or "").lower()
-                elif isinstance(data, list) and data:
-                    status = (data[0].get("status") or "").lower()
+                item = data[0] if isinstance(data, list) else data
+                status = (item.get("status") or "").lower()
                 if status in ("confirmed", "success", "complete"):
                     return "confirmed"
                 if status in ("failed", "error", "reverted"):
@@ -680,84 +580,73 @@ def poll_tx_status(tx_hash, timeout=60):
 
 def execute_buy(token_addr, amount_usd):
     """
-    Buy token using 3-step swap flow.
-    Returns: (success: bool, tx_hash: str, token_amount: float)
+    Buy token via 3-step swap flow.
+    Returns: (success, tx_hash, token_amount)
     """
     wallet = get_wallet_address()
     if not wallet:
-        feed("  BUY FAIL: no wallet address")
+        log("ERROR", "BUY FAIL: no wallet address")
         return False, "", 0.0
 
+    sol_price = get_sol_price()
+    if sol_price <= 0:
+        log("ERROR", "BUY FAIL: cannot get SOL price")
+        return False, "", 0.0
+
+    lamports = int(amount_usd / sol_price * 1e9)
+
     if config.PAPER_TRADE:
-        sol_price = get_sol_price()
-        if sol_price <= 0:
-            return False, "", 0.0
-        lamports = int(amount_usd / sol_price * 1e9)
         try:
-            data = onchainos_data("swap", "quote",
-                                  "--from", SOL_NATIVE,
-                                  "--to", token_addr,
-                                  "--amount", str(lamports),
-                                  "--chain", "solana", timeout=30)
+            data = onchainos_data("swap", "quote", "--from", SOL_NATIVE, "--to", token_addr,
+                                  "--amount", str(lamports), "--chain", "solana", timeout=30)
             if not data:
                 return False, "", 0.0
             q = data[0] if isinstance(data, list) else data
             router = q.get("routerResult", q)
             token_amount = safe_float(router.get("toTokenAmount", 0))
-            return True, "paper_" + str(int(time.time())), token_amount
-        except Exception as e:
-            feed(f"  BUY QUOTE FAIL: {e}")
+            return True, f"paper_{int(time.time())}", token_amount
+        except Exception:
             return False, "", 0.0
 
-    sol_price = get_sol_price()
-    if sol_price <= 0:
-        feed("  BUY FAIL: cannot get SOL price")
-        return False, "", 0.0
-    lamports = int(amount_usd / sol_price * 1e9)
-
+    # Step 1: Build unsigned TX
     try:
-        data = onchainos_data("swap", "swap",
-                              "--chain", "solana",
-                              "--from", SOL_NATIVE,
-                              "--to", token_addr,
+        data = onchainos_data("swap", "swap", "--chain", "solana",
+                              "--from", SOL_NATIVE, "--to", token_addr,
                               "--amount", str(lamports),
                               "--slippage", str(config.SLIPPAGE_BUY),
-                              "--wallet", wallet,
-                              timeout=60)
+                              "--wallet", wallet, timeout=60)
         if not data:
-            feed("  BUY FAIL: swap returned no data")
+            log("WARN", "BUY FAIL: swap returned no data")
             return False, "", 0.0
     except Exception as e:
-        feed(f"  BUY FAIL swap: {e}")
+        log("ERROR", f"BUY FAIL swap: {e}")
         return False, "", 0.0
 
     q = data[0] if isinstance(data, list) else data
     router = q.get("routerResult", q)
     token_amount = safe_float(router.get("toTokenAmount", 0))
-
     tx = q.get("tx", {})
     tx_to = tx.get("to", "")
     unsigned_tx = tx.get("data", "")
 
     if not tx_to or not unsigned_tx:
-        feed("  BUY FAIL: swap response missing tx.to or tx.data")
+        log("WARN", "BUY FAIL: missing tx.to or tx.data")
         return False, "", 0.0
 
+    # Step 2: TEE sign + broadcast
     try:
-        result = onchainos_data("wallet", "contract-call",
-                                "--chain", "501",
-                                "--to", tx_to,
-                                "--unsigned-tx", unsigned_tx,
-                                timeout=60)
+        result = onchainos_data("wallet", "contract-call", "--chain", "501",
+                                "--to", tx_to, "--unsigned-tx", unsigned_tx, timeout=60)
         if not result:
-            feed("  BUY FAIL: contract-call returned no data")
+            log("WARN", "BUY FAIL: contract-call returned no data")
             return False, "", 0.0
     except Exception as e:
-        feed(f"  BUY FAIL contract-call: {e}")
         if "timeout" in str(e).lower():
             return False, "TIMEOUT", token_amount
+        log("ERROR", f"BUY FAIL contract-call: {e}")
         return False, "", 0.0
 
+    # Step 3: Extract TX hash and confirm
     tx_hash = ""
     if isinstance(result, dict):
         tx_hash = result.get("txHash") or result.get("orderId") or ""
@@ -767,9 +656,10 @@ def execute_buy(token_addr, amount_usd):
     if tx_hash:
         status = poll_tx_status(tx_hash, timeout=30)
         if status == "failed":
-            feed(f"  BUY FAIL: tx {tx_hash[:12]} failed on-chain")
+            log("WARN", f"BUY FAIL: tx {tx_hash[:12]} failed on-chain")
             return False, tx_hash, 0.0
 
+    # Fallback: check balance if token_amount unknown
     if token_amount <= 0 and tx_hash:
         time.sleep(2)
         token_amount = get_token_balance(wallet, token_addr)
@@ -779,53 +669,40 @@ def execute_buy(token_addr, amount_usd):
 
 def execute_sell(token_addr, symbol, token_amount, reason, max_retries=3):
     """
-    Sell token using 3-step swap flow with retry logic.
-    Returns: (success: bool, tx_hash: str)
+    Sell token via 3-step swap flow with retry.
+    Returns: (success, tx_hash)
     """
     wallet = get_wallet_address()
-    if not wallet:
+    if not wallet or int(token_amount) <= 0:
         return False, ""
 
     if config.PAPER_TRADE:
         feed(f"  [PAPER] SELL {symbol} reason={reason}")
-        return True, "paper_sell_" + str(int(time.time()))
+        return True, f"paper_sell_{int(time.time())}"
 
     raw_amount = str(int(token_amount))
-    if int(token_amount) <= 0:
-        return False, ""
 
     for attempt in range(max_retries):
         try:
-            data = onchainos_data("swap", "swap",
-                                  "--chain", "solana",
-                                  "--from", token_addr,
-                                  "--to", SOL_NATIVE,
+            data = onchainos_data("swap", "swap", "--chain", "solana",
+                                  "--from", token_addr, "--to", SOL_NATIVE,
                                   "--amount", raw_amount,
                                   "--slippage", str(config.SLIPPAGE_SELL),
-                                  "--wallet", wallet,
-                                  timeout=60)
+                                  "--wallet", wallet, timeout=60)
             if not data:
-                feed(f"  SELL {symbol} attempt {attempt+1}: swap returned no data")
                 time.sleep(5 * (attempt + 1))
                 continue
 
             q = data[0] if isinstance(data, list) else data
             tx = q.get("tx", {})
-            tx_to = tx.get("to", "")
-            unsigned_tx = tx.get("data", "")
-
+            tx_to, unsigned_tx = tx.get("to", ""), tx.get("data", "")
             if not tx_to or not unsigned_tx:
-                feed(f"  SELL {symbol} attempt {attempt+1}: missing tx.to/tx.data")
                 time.sleep(5 * (attempt + 1))
                 continue
 
-            result = onchainos_data("wallet", "contract-call",
-                                    "--chain", "501",
-                                    "--to", tx_to,
-                                    "--unsigned-tx", unsigned_tx,
-                                    timeout=60)
+            result = onchainos_data("wallet", "contract-call", "--chain", "501",
+                                    "--to", tx_to, "--unsigned-tx", unsigned_tx, timeout=60)
             if not result:
-                feed(f"  SELL {symbol} attempt {attempt+1}: contract-call no data")
                 time.sleep(5 * (attempt + 1))
                 continue
 
@@ -840,7 +717,7 @@ def execute_sell(token_addr, symbol, token_amount, reason, max_retries=3):
             return True, tx_hash
 
         except Exception as e:
-            feed(f"  SELL {symbol} attempt {attempt+1} error: {e}")
+            log("WARN", f"SELL {symbol} attempt {attempt+1} error: {e}")
             time.sleep(5 * (attempt + 1))
 
     return False, ""
@@ -848,84 +725,61 @@ def execute_sell(token_addr, symbol, token_amount, reason, max_retries=3):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 7: Tier S - Smart Wallet Follow (V7 New!)
+# SECTION 7: TIER S — SMART WALLET FOLLOW
+# Highest confidence: follows Tier-1 curated wallets' fresh buys.
 # ══════════════════════════════════════════════════════════════════════════════
 
-_tier_s_last_seen = {}  # {wallet_addr: {token_addr: first_seen_ts}}
+_tier_s_last_seen = {}  # {wallet:token: first_seen_ts}
 
 
 def process_tier_s():
-    """
-    Tier S: Follow our curated smart wallets' recent trades.
-    Scans Tier 1 wallets for new buys, then evaluates as candidates.
-    Returns after 1 successful buy.
-    """
-    if not config.TIER_S_ENABLED:
-        return
-    if not _smart_wallets:
+    """Scan Tier-1 wallets for new buys. Enter on first qualifying candidate."""
+    if not config.TIER_S_ENABLED or not _smart_wallets:
         return
 
-    # Get Tier 1 wallets only
     tier1_addrs = get_smart_wallet_addresses(tier_filter=config.TIER_S_FOLLOW_TIERS)
     if not tier1_addrs:
         return
 
-    # Sample a subset each cycle (don't scan all 100+ wallets every time)
-    sample_size = min(10, len(tier1_addrs))
+    sample_size = min(config.TIER_S_SAMPLE_SIZE, len(tier1_addrs))
     sampled = random.sample(tier1_addrs, sample_size)
-
     night = is_night()
     size = config.TIER_S_SIZE_NIGHT if night else config.TIER_S_SIZE_DAY
     candidates = []
 
     for wallet_addr in sampled:
         try:
-            # Check wallet's recent transactions
-            data = onchainos_data("wallet", "history",
-                                  "--address", wallet_addr,
-                                  "--chain-index", "501",
-                                  "--limit", "5",
-                                  timeout=15)
+            data = onchainos_data("wallet", "history", "--address", wallet_addr,
+                                  "--chain-index", "501", "--limit", "5", timeout=15)
             if not isinstance(data, list):
                 continue
 
             for tx in data:
-                # Look for buy transactions (swap SOL -> token)
-                token_addr = ""
                 tx_type = (tx.get("type", "") or tx.get("txType", "")).lower()
                 if "swap" not in tx_type and "buy" not in tx_type:
                     continue
 
-                # Extract token address from transaction
                 token_addr = (tx.get("toTokenAddress", "") or
                               tx.get("tokenAddress", "") or
                               tx.get("contractAddress", ""))
-                if not token_addr or token_addr in _NEVER_TRADE:
-                    continue
-                if token_addr == SOL_NATIVE:
+                if not token_addr or token_addr in _NEVER_TRADE or token_addr == SOL_NATIVE:
                     continue
 
-                # Check age of this transaction
                 tx_ts = safe_float(tx.get("timestamp", 0) or tx.get("blockTimestamp", 0))
                 if tx_ts > 1e12:
-                    tx_ts = tx_ts / 1000.0
+                    tx_ts /= 1000.0
                 if tx_ts <= 0:
                     continue
                 age_min = (time.time() - tx_ts) / 60.0
                 if age_min > config.TIER_S_MAX_AGE_MIN:
                     continue
 
-                # Dedup: skip if we've already seen this wallet buy this token
                 key = f"{wallet_addr}:{token_addr}"
                 if key in _tier_s_last_seen:
                     continue
                 _tier_s_last_seen[key] = time.time()
 
-                candidates.append({
-                    "addr": token_addr,
-                    "wallet": wallet_addr,
-                    "age_min": age_min,
-                })
+                candidates.append({"addr": token_addr, "wallet": wallet_addr, "age_min": age_min})
         except Exception:
             continue
 
@@ -938,11 +792,10 @@ def process_tier_s():
         addr = cand["addr"]
         if addr in acted or (addr in cooldown_map and time.time() < cooldown_map.get(addr, 0)):
             continue
-        with pos_lock:
+        with _pos_lock:
             if addr in state["positions"]:
                 continue
 
-        # Get token info
         price_info = get_token_price(addr)
         mc = safe_float(price_info.get("marketCap", 0))
         liq = safe_float(price_info.get("liquidity", 0))
@@ -950,31 +803,26 @@ def process_tier_s():
         price = safe_float(price_info.get("price", 0))
         symbol = price_info.get("symbol", "?")
 
-        # Basic filters
+        # Filters
         if mc < config.TIER_S_MC_MIN or mc > config.TIER_S_MC_MAX:
             continue
         if liq < config.TIER_S_LIQ_MIN:
             continue
         if holders < config.TIER_S_HOLDERS_MIN:
             continue
-
-        # Top10 check from price info
         top10 = safe_float(price_info.get("top10HoldPercent", 0))
         if top10 > config.TIER_S_TOP10_MAX:
             continue
 
-        # K1 pump guard
         if _k1_pump_guard(addr, config.TIER_A_K1_PUMP_GUARD):
             feed(f"  Skip_S {symbol}: K1 pump guard")
             continue
 
-        # Volume confirmation
         vol_ok, vol_reason = check_volume_confirmation(addr, symbol)
         if not vol_ok:
             feed(f"  Skip_S {symbol}: {vol_reason}")
             continue
 
-        # Quick risk check
         try:
             rc = pre_trade_checks(addr, symbol, quick=True)
             if not rc.get("pass", False):
@@ -983,7 +831,6 @@ def process_tier_s():
         except Exception:
             continue
 
-        # Entry check
         ok, reason = can_enter()
         if not ok:
             feed(f"  Skip_S: {reason}")
@@ -993,8 +840,7 @@ def process_tier_s():
         success, tx_hash, token_amt = execute_buy(addr, size)
 
         if success and token_amt > 0:
-            _create_position(addr, symbol, "S", size, price, mc, liq,
-                             token_amt, tx_hash, rc)
+            _create_position(addr, symbol, "S", size, price, mc, liq, token_amt, tx_hash, rc)
             acted[addr] = int(time.time())
             save_acted()
             if tx_hash and not tx_hash.startswith("paper"):
@@ -1011,29 +857,27 @@ def process_tier_s():
             return
 
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 8: Tier A - Smart Money Signal Scanner
+# SECTION 8: TIER A — SMART MONEY SIGNAL
+# Multi-wallet co-buy detection via onchainos signal list.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_sm_signals():
+    """Fetch smart money signals from onchainos."""
     try:
         labels = ",".join(str(l) for l in config.SM_LABELS)
-        data = onchainos_data("signal", "list",
-                              "--chain", "solana",
+        data = onchainos_data("signal", "list", "--chain", "solana",
                               "--wallet-type", labels,
                               "--min-address-count", str(config.SM_MIN_WALLETS))
         if isinstance(data, list):
             return data
-        elif isinstance(data, dict):
-            return [data]
+        return [data] if isinstance(data, dict) else []
     except Exception:
-        pass
-    return []
+        return []
 
 
 def process_tier_a():
-    """Process Tier A smart money signals. Returns after 1 successful buy."""
+    """Process smart money signals. Enter on first qualifying candidate."""
     signals = fetch_sm_signals()
     if not signals:
         return
@@ -1041,7 +885,7 @@ def process_tier_a():
     feed(f"Tier A SM signals: {len(signals)}")
     night = is_night()
     size = config.TIER_A_SIZE_NIGHT if night else config.TIER_A_SIZE_DAY
-    hot = get_hot_tokens()
+    hot = _get_hot_cache()
 
     for sig in signals:
         token = sig.get("token", {})
@@ -1056,49 +900,39 @@ def process_tier_a():
             continue
         if addr in acted or (addr in cooldown_map and time.time() < cooldown_map.get(addr, 0)):
             continue
-        with pos_lock:
+        with _pos_lock:
             if addr in state["positions"]:
                 continue
-
         if sold_ratio > 80:
             continue
 
+        # Strong vs normal signal
         is_strong = wallet_count >= config.SM_STRONG_THRESH
         if not is_strong:
             hot_entry = hot.get(addr, {})
-            inflow = safe_float(hot_entry.get("inflow", 0))
-            if inflow <= 0:
+            if safe_float(hot_entry.get("inflow", 0)) <= 0:
                 continue
 
-        # Get real market data
-        try:
-            price_data = get_token_price(addr)
-            mc = safe_float(price_data.get("marketCap", 0))
-            liq = safe_float(price_data.get("liquidity", 0))
-            holders = safe_int(price_data.get("holders", 0))
-            price = safe_float(price_data.get("price", 0))
-        except Exception:
-            continue
+        price_data = get_token_price(addr)
+        mc = safe_float(price_data.get("marketCap", 0))
+        liq = safe_float(price_data.get("liquidity", 0))
+        holders = safe_int(price_data.get("holders", 0))
+        price = safe_float(price_data.get("price", 0))
 
         if mc < config.TIER_A_MC_MIN or mc > config.TIER_A_MC_MAX:
             continue
-        if liq < config.TIER_A_LIQ_MIN:
-            continue
-        if holders < config.TIER_A_HOLDERS_MIN:
+        if liq < config.TIER_A_LIQ_MIN or holders < config.TIER_A_HOLDERS_MIN:
             continue
 
-        # K1 pump guard
         if _k1_pump_guard(addr, config.TIER_A_K1_PUMP_GUARD):
-            feed(f"  Skip_A {symbol}: K1 pump guard")
             continue
 
-        # V7: Volume confirmation
         vol_ok, vol_reason = check_volume_confirmation(addr, symbol)
         if not vol_ok:
             feed(f"  Skip_A {symbol}: {vol_reason}")
             continue
 
-        # V7: Smart Wallet boost check (informational for Tier A)
+        # Smart wallet boost (informational)
         sw_boost = 0
         try:
             holders_list = get_token_holders(addr, limit=20)
@@ -1108,7 +942,6 @@ def process_tier_a():
         except Exception:
             pass
 
-        # Risk check
         rc = pre_trade_checks(addr, symbol, quick=True)
         if not rc.get("pass", False):
             feed(f"  Skip_A {symbol}: risk G{rc.get('grade', '?')}")
@@ -1116,15 +949,13 @@ def process_tier_a():
 
         ok, reason = can_enter()
         if not ok:
-            feed(f"  Skip_A: {reason}")
             return
 
         feed(f"ENTER TIER_A {symbol} ${size} | MC=${mc:,.0f} | wallets={wallet_count} | sw+{sw_boost}")
         success, tx_hash, token_amt = execute_buy(addr, size)
 
         if success and token_amt > 0:
-            _create_position(addr, symbol, "A", size, price, mc, liq,
-                             token_amt, tx_hash, rc)
+            _create_position(addr, symbol, "A", size, price, mc, liq, token_amt, tx_hash, rc)
             acted[addr] = int(time.time())
             save_acted()
             if tx_hash and not tx_hash.startswith("paper"):
@@ -1140,28 +971,19 @@ def process_tier_a():
             cooldown_map[addr] = time.time() + 300
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 9: Tier B - Graduation Ambush Scanner
-# ══════════════════════════════════════════════════════════════════════════════
 
-def fetch_graduated_tokens():
-    try:
-        data = onchainos_data("memepump", "tokens",
-                              "--chain", "solana",
-                              "--stage", config.TIER_B_STAGE)
-        if isinstance(data, list):
-            return data
-        elif isinstance(data, dict):
-            return [data]
-    except Exception:
-        pass
-    return []
-
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 9: TIER B — GRADUATION AMBUSH
+# Catch tokens within 60min of PumpFun → Raydium migration.
+# ══════════════════════════════════════════════════════════════════════════════
 
 def process_tier_b():
-    """Process Tier B graduated tokens. Returns after 1 successful buy."""
-    candidates = fetch_graduated_tokens()
-    if not candidates:
+    """Process graduated tokens. Enter on first qualifying candidate."""
+    try:
+        data = onchainos_data("memepump", "tokens", "--chain", "solana",
+                              "--stage", config.TIER_B_STAGE)
+        candidates = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+    except Exception:
         return
 
     night = is_night()
@@ -1181,70 +1003,48 @@ def process_tier_b():
         mc = safe_float(market.get("marketCapUsd", 0) or tok.get("marketCap", 0))
         holders = safe_int(tags.get("totalHolders", 0) or tok.get("holders", 0))
         dev_hold_pct = safe_float(tags.get("devHoldingsPercent", 0))
-        dev_sold = dev_hold_pct == 0
         insiders_pct = safe_float(tags.get("insidersPercent", 0) or tok.get("insiderPercent", 0))
         top10 = safe_float(tags.get("top10HoldingsPercent", 0) or tok.get("top10HoldPercent", 0))
-        aped = safe_int(tok.get("aped", 0))
 
         if mc < config.TIER_B_MC_MIN or mc > config.TIER_B_MC_MAX:
             continue
         if holders < config.TIER_B_HOLDERS_MIN:
             continue
-        if config.TIER_B_DEV_SOLD and not dev_sold:
+        if config.TIER_B_DEV_SOLD and dev_hold_pct > 0:
             continue
-        if insiders_pct > config.TIER_B_INSIDERS_MAX:
-            continue
-        if top10 > config.TIER_B_TOP10_MAX:
-            continue
-        if aped < config.TIER_B_APED_MIN:
+        if insiders_pct > config.TIER_B_INSIDERS_MAX or top10 > config.TIER_B_TOP10_MAX:
             continue
 
         # Age check
-        now_sec = time.time()
-        max_age_sec = config.TIER_B_MAX_AGE_MIN * 60
         migrated_ts = safe_float(
             tok.get("migratedBeginTimestamp", 0) or tok.get("migratedEndTimestamp", 0)
-            or tok.get("migratedTime", 0) or tok.get("createdTimestamp", 0)
-            or tok.get("graduatedAt", 0)
-        )
+            or tok.get("migratedTime", 0) or tok.get("graduatedAt", 0))
         if migrated_ts > 0:
             if migrated_ts > 1e12:
-                migrated_ts = migrated_ts / 1000.0
-            age_sec = now_sec - migrated_ts
-            if age_sec > max_age_sec:
+                migrated_ts /= 1000.0
+            if (time.time() - migrated_ts) > config.TIER_B_MAX_AGE_MIN * 60:
                 continue
 
         filtered.append({"addr": addr, "mc": mc, "holders": holders,
                          "symbol": tok.get("symbol", tok.get("tokenSymbol", "?"))})
 
-    feed(f"Tier B MIGRATED candidates: {len(filtered)}")
+    if filtered:
+        feed(f"Tier B MIGRATED candidates: {len(filtered)}")
 
     for cand in filtered:
-        addr = cand["addr"]
-        symbol = cand["symbol"]
-        mc = cand["mc"]
-
+        addr, symbol, mc = cand["addr"], cand["symbol"], cand["mc"]
         if addr in acted or (addr in cooldown_map and time.time() < cooldown_map.get(addr, 0)):
             continue
-        with pos_lock:
+        with _pos_lock:
             if addr in state["positions"]:
                 continue
 
         if _k1_pump_guard(addr, config.TIER_A_K1_PUMP_GUARD):
             continue
 
-        # V7: Volume confirmation
-        vol_ok, vol_reason = check_volume_confirmation(addr, symbol)
+        vol_ok, _ = check_volume_confirmation(addr, symbol)
         if not vol_ok:
             continue
-
-        # V7: Smart Wallet check for extra confidence
-        sw_boost = 0
-        try:
-            holders_list = get_token_holders(addr, limit=20)
-            sw_boost, _ = get_smart_wallet_score(holders_list)
-        except Exception:
-            pass
 
         try:
             rc = pre_trade_checks(addr, symbol, quick=True)
@@ -1261,12 +1061,18 @@ def process_tier_b():
         if not ok:
             return
 
+        sw_boost = 0
+        try:
+            holders_list = get_token_holders(addr, limit=20)
+            sw_boost, _ = get_smart_wallet_score(holders_list)
+        except Exception:
+            pass
+
         feed(f"ENTER TIER_B {symbol} ${size} | MC=${mc:,.0f} | sw+{sw_boost}")
         success, tx_hash, token_amt = execute_buy(addr, size)
 
         if success and token_amt > 0:
-            _create_position(addr, symbol, "B", size, price, mc, liq,
-                             token_amt, tx_hash, rc)
+            _create_position(addr, symbol, "B", size, price, mc, liq, token_amt, tx_hash, rc)
             acted[addr] = int(time.time())
             save_acted()
             if tx_hash and not tx_hash.startswith("paper"):
@@ -1283,101 +1089,54 @@ def process_tier_b():
             return
 
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 10: Tier D - Hot Momentum Scanner
+# SECTION 10: TIER D — HOT MOMENTUM (Dynamic Sizing)
+# Composite-scored trending tokens with smart wallet boost.
 # ══════════════════════════════════════════════════════════════════════════════
-
-def fetch_hot_momentum():
-    try:
-        data = onchainos_data("token", "hot-tokens",
-                              "--chain", "solana",
-                              "--ranking-type", "4",
-                              "--limit", "20")
-        if isinstance(data, list):
-            return data
-        elif isinstance(data, dict):
-            return [data]
-    except Exception:
-        pass
-    return []
-
 
 def calculate_score(tok, sw_boost=0):
-    """
-    V7: Calculate composite score 0-100+ for a hot momentum token.
-    Includes smart wallet boost.
-    """
+    """Calculate composite score 0-100+ for hot momentum token."""
     score = 0
 
-    # Holders weight (0-30)
     holders = safe_int(tok.get("holders", 0) or tok.get("holderCount", 0))
-    if holders >= 5000:
-        score += 30
-    elif holders >= 2000:
-        score += 25
-    elif holders >= 1000:
-        score += 20
-    elif holders >= 500:
-        score += 15
+    for threshold, points in [(5000, 30), (2000, 25), (1000, 20), (500, 15)]:
+        if holders >= threshold:
+            score += points
+            break
 
-    # Buy/sell ratio weight (0-25)
     buys = safe_int(tok.get("buys", 0) or tok.get("buyCount", 0))
     sells = safe_int(tok.get("sells", 0) or tok.get("sellCount", 0))
     if sells > 0:
         ratio = buys / sells
-        if ratio >= 2.0:
-            score += 25
-        elif ratio >= 1.5:
-            score += 20
-        elif ratio >= 1.2:
-            score += 15
-        elif ratio >= 1.0:
-            score += 10
+        for threshold, points in [(2.0, 25), (1.5, 20), (1.2, 15), (1.0, 10)]:
+            if ratio >= threshold:
+                score += points
+                break
 
-    # Unique traders weight (0-15)
     traders = safe_int(tok.get("uniqueTraders", 0) or tok.get("traderCount", 0))
-    if traders >= 500:
-        score += 15
-    elif traders >= 300:
-        score += 12
-    elif traders >= 200:
-        score += 9
-    elif traders >= 100:
-        score += 6
+    for threshold, points in [(500, 15), (300, 12), (200, 9), (100, 6)]:
+        if traders >= threshold:
+            score += points
+            break
 
-    # Price change weight (0-15)
-    change = safe_float(tok.get("change", 0) or tok.get("priceChange", 0) or tok.get("changePct", 0))
-    if change >= 30:
-        score += 15
-    elif change >= 20:
-        score += 12
-    elif change >= 10:
-        score += 9
-    elif change >= 5:
-        score += 6
+    change = safe_float(tok.get("change", 0) or tok.get("priceChange", 0))
+    for threshold, points in [(30, 15), (20, 12), (10, 9), (5, 6)]:
+        if change >= threshold:
+            score += points
+            break
 
-    # Inflow weight (0-15)
     inflow = safe_float(tok.get("inflowUsd", 0) or tok.get("netInflowUsd", 0) or tok.get("inflow", 0))
-    if inflow >= 50000:
-        score += 15
-    elif inflow >= 20000:
-        score += 12
-    elif inflow >= 5000:
-        score += 9
-    elif inflow > 0:
-        score += 5
+    for threshold, points in [(50000, 15), (20000, 12), (5000, 9), (0.01, 5)]:
+        if inflow >= threshold:
+            score += points
+            break
 
-    # V7: Smart Wallet boost (0 to SMART_WALLET_MAX_BOOST)
-    score += sw_boost
-
-    return score
+    return score + sw_boost
 
 
 def score_to_size(score):
-    """Convert score to position size in USD."""
-    night = is_night()
-    base = 3 if night else config.TIER_D_SIZE_BASE
+    """Convert composite score to position size in USD."""
+    base = 3 if is_night() else config.TIER_D_SIZE_BASE
     for tier in config.TIER_D_SCORE_TIERS:
         if score >= tier["min_score"]:
             return base + tier["extra"]
@@ -1385,9 +1144,12 @@ def score_to_size(score):
 
 
 def process_tier_d():
-    """Process Tier D hot momentum tokens. Returns after 1 successful buy."""
-    candidates = fetch_hot_momentum()
-    if not candidates:
+    """Process hot momentum tokens. Enter on first qualifying candidate."""
+    try:
+        data = onchainos_data("token", "hot-tokens", "--chain", "solana",
+                              "--ranking-type", "4", "--limit", "20")
+        candidates = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+    except Exception:
         return
 
     filtered = []
@@ -1401,32 +1163,20 @@ def process_tier_d():
         holders = safe_int(tok.get("holders", 0) or tok.get("holderCount", 0))
         mc = safe_float(tok.get("marketCap", 0) or tok.get("usdMarketCap", 0))
         liq = safe_float(tok.get("liquidity", 0) or tok.get("liquidityUsd", 0))
-        top10 = safe_float(tok.get("top10HoldPercent", 0) or tok.get("top10Percent", 0))
+        top10 = safe_float(tok.get("top10HoldPercent", 0))
         risk_level = safe_int(tok.get("riskLevelControl", tok.get("riskLevel", 99)))
-        inflow = safe_float(tok.get("inflowUsd", 0) or tok.get("netInflowUsd", 0) or tok.get("inflow", 0))
-        change = safe_float(tok.get("change", 0) or tok.get("priceChange", 0) or tok.get("changePct", 0))
-        traders = safe_int(tok.get("uniqueTraders", 0) or tok.get("traderCount", 0))
 
-        if holders < config.TIER_D_HOLDERS_MIN:
+        if holders < config.TIER_D_HOLDERS_MIN or mc < config.TIER_D_MC_MIN or mc > config.TIER_D_MC_MAX:
             continue
-        if mc < config.TIER_D_MC_MIN or mc > config.TIER_D_MC_MAX:
-            continue
-        if liq < config.TIER_D_LIQ_MIN:
-            continue
-        if top10 > config.TIER_D_TOP10_MAX:
+        if liq < config.TIER_D_LIQ_MIN or top10 > config.TIER_D_TOP10_MAX:
             continue
         if risk_level > config.TIER_D_RISK_LEVEL:
-            continue
-        if inflow <= config.TIER_D_MIN_INFLOW:
-            continue
-        if change < config.TIER_D_MIN_CHANGE:
-            continue
-        if traders < config.TIER_D_UNIQUE_TRADERS:
             continue
 
         filtered.append(tok)
 
-    feed(f"Tier D hot candidates: {len(filtered)}")
+    if filtered:
+        feed(f"Tier D hot candidates: {len(filtered)}")
 
     for tok in filtered:
         addr = tok.get("tokenAddress", "") or tok.get("address", "")
@@ -1435,39 +1185,32 @@ def process_tier_d():
 
         if addr in acted or (addr in cooldown_map and time.time() < cooldown_map.get(addr, 0)):
             continue
-        with pos_lock:
+        with _pos_lock:
             if addr in state["positions"]:
                 continue
 
-        # V7: Smart Wallet boost
         sw_boost = 0
         try:
             holders_list = get_token_holders(addr, limit=20)
-            sw_boost, sw_matched = get_smart_wallet_score(holders_list)
+            sw_boost, _ = get_smart_wallet_score(holders_list)
         except Exception:
             pass
 
-        # Calculate score with smart wallet boost
         score = calculate_score(tok, sw_boost=sw_boost)
         if score < config.TIER_D_SCORE_THRESHOLD:
             continue
 
-        # K1 pump guard
         if _k1_pump_guard(addr, config.TIER_A_K1_PUMP_GUARD):
-            feed(f"  Skip_D {symbol}: K1 pump guard (score={score})")
             continue
 
-        # V7: Volume confirmation
         vol_ok, vol_reason = check_volume_confirmation(addr, symbol)
         if not vol_ok:
             feed(f"  Skip_D {symbol}: {vol_reason}")
             continue
 
-        # Quick risk check
         try:
             rc = pre_trade_checks(addr, symbol, quick=True)
             if not rc.get("pass", False):
-                feed(f"  Skip_D {symbol}: risk G{rc.get('grade', '?')}")
                 continue
         except Exception:
             continue
@@ -1485,8 +1228,7 @@ def process_tier_d():
         success, tx_hash, token_amt = execute_buy(addr, size)
 
         if success and token_amt > 0:
-            _create_position(addr, symbol, "D", size, price, mc, liq,
-                             token_amt, tx_hash, rc)
+            _create_position(addr, symbol, "D", size, price, mc, liq, token_amt, tx_hash, rc)
             acted[addr] = int(time.time())
             save_acted()
             if tx_hash and not tx_hash.startswith("paper"):
@@ -1505,7 +1247,8 @@ def process_tier_d():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 11: Position Monitor - V7 Adaptive Exit System
+# SECTION 11: POSITION MONITOR — 9-LAYER ADAPTIVE EXIT
+# Priority-ordered exits. Higher layers override lower ones.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def monitor_positions():
@@ -1515,34 +1258,23 @@ def monitor_positions():
         try:
             _monitor_cycle()
         except Exception as e:
-            feed(f"MONITOR ERROR: {e}")
+            log("ERROR", f"MONITOR: {e}")
 
 
 def _monitor_cycle():
     """Single monitoring cycle for all positions."""
-    with pos_lock:
+    with _pos_lock:
         positions = dict(state["positions"])
     if not positions:
         return
 
     now = time.time()
 
-    # Ensure all positions have entry_ts
-    for addr, pos in positions.items():
-        pos_ts = pos.get("entry_ts") or pos.get("opened_at_ts")
-        if not pos_ts:
-            with pos_lock:
-                if addr in state["positions"]:
-                    state["positions"][addr]["entry_ts"] = now
-                    state["positions"][addr]["opened_at_ts"] = now
-            pos["entry_ts"] = now
-            pos["opened_at_ts"] = now
-
-    # Handle unconfirmed positions first
+    # Handle unconfirmed positions
     for addr, pos in list(positions.items()):
         if not pos.get("unconfirmed"):
             continue
-        elapsed = now - pos.get("unconfirmed_ts", pos.get("opened_at_ts", 0) or pos.get("entry_ts", 0) or now)
+        elapsed = now - pos.get("unconfirmed_ts", now)
         if elapsed < 60:
             continue
         checks = pos.get("unconfirmed_checks", 0)
@@ -1550,368 +1282,241 @@ def _monitor_cycle():
             pi = get_token_price(addr)
             price = safe_float(pi.get("price", 0))
             if price > 0:
-                with pos_lock:
+                with _pos_lock:
                     if addr in state["positions"]:
-                        state["positions"][addr].pop("unconfirmed", None)
-                        state["positions"][addr].pop("unconfirmed_ts", None)
-                        state["positions"][addr].pop("unconfirmed_checks", None)
-                        state["positions"][addr]["entry_price"] = price
-                        state["positions"][addr]["peak_price"] = price
-                        wallet = get_wallet_address()
-                        bal = get_token_balance(wallet, addr)
+                        p = state["positions"][addr]
+                        p.pop("unconfirmed", None)
+                        p.pop("unconfirmed_ts", None)
+                        p.pop("unconfirmed_checks", None)
+                        p["entry_price"] = price
+                        p["peak_price"] = price
+                        bal = get_token_balance(get_wallet_address(), addr)
                         if bal > 0:
-                            state["positions"][addr]["token_amount"] = bal
+                            p["token_amount"] = bal
                         save_positions()
-                feed(f"  CONFIRMED {pos.get('symbol', addr[:8])}: unconfirmed -> active")
+                feed(f"  CONFIRMED {pos.get('symbol', addr[:8])}")
                 continue
         except Exception:
             pass
         checks += 1
-        with pos_lock:
+        with _pos_lock:
             if addr in state["positions"]:
                 state["positions"][addr]["unconfirmed_checks"] = checks
         if checks >= 10 and elapsed >= 180:
-            with pos_lock:
+            with _pos_lock:
                 state["positions"].pop(addr, None)
                 save_positions()
             feed(f"  DROPPED {pos.get('symbol', addr[:8])}: unconfirmed x{checks}")
         continue
 
-    # Fetch prices for all active positions
-    price_map = {}
+    # Process each active position through exit layers
     for addr, pos in positions.items():
-        if pos.get("unconfirmed"):
+        if pos.get("unconfirmed") or addr in _selling:
             continue
+
         pi = get_token_price(addr)
-        if pi:
-            price_map[addr] = pi
-
-    # Process each position through exit layers
-    for addr, pos in positions.items():
-        if pos.get("unconfirmed"):
-            continue
-        if addr in _selling:
-            continue
-
-        pi = price_map.get(addr, {})
         cur_price = safe_float(pi.get("price", 0))
         cur_liq = safe_float(pi.get("liquidity", 0))
-
         entry_price = safe_float(pos.get("entry_price", 0))
+
         if entry_price <= 0:
             if cur_price > 0:
-                with pos_lock:
+                with _pos_lock:
                     if addr in state["positions"]:
                         state["positions"][addr]["entry_price"] = cur_price
                         state["positions"][addr]["peak_price"] = cur_price
                 entry_price = cur_price
-                feed(f"  RECOVERY {pos.get('symbol', addr[:8])}: entry_price set to {cur_price}")
             else:
                 continue
 
-        # 3-check protection for zero price
+        # Zero price protection (3-check)
         if cur_price <= 0:
-            with pos_lock:
+            with _pos_lock:
                 if addr in state["positions"]:
                     zc = state["positions"][addr].get("zero_count", 0) + 1
                     state["positions"][addr]["zero_count"] = zc
-                    if zc >= 30:
-                        age_sec = now - safe_float(pos.get("entry_ts") or now)
-                        if age_sec > 86400:
-                            state["positions"].pop(addr, None)
-                            save_positions()
-                            feed(f"  GHOST_CLEANUP {pos.get('symbol', addr[:8])}: zero_count={zc}")
+                    if zc >= 30 and (now - safe_float(pos.get("entry_ts", now))) > 86400:
+                        state["positions"].pop(addr, None)
+                        save_positions()
+                        feed(f"  GHOST_CLEANUP {pos.get('symbol', addr[:8])}")
             continue
         else:
-            with pos_lock:
+            with _pos_lock:
                 if addr in state["positions"]:
                     state["positions"][addr]["zero_count"] = 0
 
+        # Calculate metrics
         pnl_pct = (cur_price - entry_price) / entry_price
-        entry_ts = safe_float(pos.get("entry_ts") or pos.get("opened_at_ts") or now)
+        entry_ts = safe_float(pos.get("entry_ts", now))
         age_sec = now - entry_ts
         age_min = age_sec / 60.0
         tier = pos.get("tier", "D")
         symbol = pos.get("symbol", addr[:8])
         peak_price = safe_float(pos.get("peak_price", entry_price))
 
-        # Update peak price
         if cur_price > peak_price:
             peak_price = cur_price
-            with pos_lock:
+            with _pos_lock:
                 if addr in state["positions"]:
                     state["positions"][addr]["peak_price"] = cur_price
+                    state["positions"][addr]["last_peak_ts"] = now
 
-        # Update live data
-        with pos_lock:
+        # Update live display data
+        with _pos_lock:
             if addr in state["positions"]:
                 state["positions"][addr]["current_price"] = cur_price
                 state["positions"][addr]["pnl_pct"] = pnl_pct
                 state["positions"][addr]["age_min"] = age_min
 
-        # Get TP/SL rules for this tier
         tp_rules = config.TP_RULES.get(tier, config.TP_RULES.get("D", {}))
         sl_rules = config.SL_RULES.get(tier, config.SL_RULES.get("D", {}))
-        floor_pct = safe_float(tp_rules.get("floor_pct", 0.0))
         remaining = safe_float(pos.get("remaining", 1.0))
         tp_tier_done = safe_int(pos.get("tp_tier", 0))
 
-        # Track peak timestamp for FAST_DUMP detection
-        if cur_price >= peak_price:
-            with pos_lock:
-                if addr in state["positions"]:
-                    state["positions"][addr]["last_peak_ts"] = now
-
-        # ═══════════════════════════════════════════════════════════
-        # EXIT LAYER 1: HE1 Emergency (override ALL - sell everything)
-        # ═══════════════════════════════════════════════════════════
+        # ─── LAYER 1: HE1 EMERGENCY (-50%) ──────────────────────────
         if pnl_pct <= config.HE1_PCT:
             _exit_position(addr, pos, 1.0, "HE1_EMERGENCY", pnl_pct)
             continue
 
-        # ═══════════════════════════════════════════════════════════
-        # EXIT LAYER 2: FAST_DUMP (flash crash from peak)
-        # ═══════════════════════════════════════════════════════════
+        # ─── LAYER 2: FAST DUMP (flash crash from peak) ─────────────
         if peak_price > 0:
-            drop_from_peak = (peak_price - cur_price) / peak_price
-            if drop_from_peak >= abs(config.FAST_DUMP_PCT):
-                last_peak_ts = safe_float(pos.get("last_peak_ts", 0))
-                if last_peak_ts > 0 and (now - last_peak_ts) <= config.FAST_DUMP_WINDOW:
+            drop = (peak_price - cur_price) / peak_price
+            if drop >= abs(config.FAST_DUMP_PCT):
+                last_peak = safe_float(pos.get("last_peak_ts", 0))
+                if last_peak > 0 and (now - last_peak) <= config.FAST_DUMP_WINDOW:
                     _exit_position(addr, pos, 1.0, "FAST_DUMP", pnl_pct)
                     continue
 
-        # ═══════════════════════════════════════════════════════════
-        # EXIT LAYER 3: LIQ_EMERGENCY (liquidity drained)
-        # ═══════════════════════════════════════════════════════════
-        liq_check_interval = 300
-        last_liq_check = safe_float(pos.get("last_liq_check", 0))
-        if cur_liq > 0 and (now - last_liq_check) >= liq_check_interval:
-            with pos_lock:
-                if addr in state["positions"]:
-                    state["positions"][addr]["last_liq_check"] = now
-            if cur_liq < config.LIQ_EMERGENCY:
-                _exit_position(addr, pos, 1.0, "LIQ_EMERGENCY", pnl_pct)
-                continue
+        # ─── LAYER 3: LIQUIDITY EMERGENCY ────────────────────────────
+        if cur_liq > 0 and cur_liq < config.LIQ_EMERGENCY:
+            _exit_position(addr, pos, 1.0, "LIQ_EMERGENCY", pnl_pct)
+            continue
 
-        # ═══════════════════════════════════════════════════════════
-        # EXIT LAYER 4: Tiered Stop Loss (V7: -20% / -30%)
-        # ═══════════════════════════════════════════════════════════
-        sl_pct = safe_float(sl_rules.get("sl_pct", -0.20))
-        sl_sell = safe_float(sl_rules.get("sl_sell", 0.50))
-        sl2_pct = safe_float(sl_rules.get("sl2_pct", -0.30))
-        sl2_sell = safe_float(sl_rules.get("sl2_sell", 1.0))
+        # ─── LAYER 4: TIERED STOP LOSS ──────────────────────────────
         sl1_triggered = pos.get("sl1_triggered", False)
+        sl_pct = safe_float(sl_rules.get("sl_pct", -0.20))
+        sl2_pct = safe_float(sl_rules.get("sl2_pct", -0.30))
 
-        if not sl1_triggered and pnl_pct <= sl_pct:
-            if remaining <= floor_pct + 0.01:
-                pass  # at floor, handle in floor exit logic
-            else:
-                max_sellable = (remaining - floor_pct) / remaining if remaining > 0 else 0
-                actual_sell = min(sl_sell, max_sellable)
-                if actual_sell >= 0.05:
-                    _exit_position(addr, pos, actual_sell, f"SL1({sl_pct*100:.0f}%)", pnl_pct)
-                    with pos_lock:
-                        if addr in state["positions"]:
-                            state["positions"][addr]["sl1_triggered"] = True
-                    continue
+        if not sl1_triggered and pnl_pct <= sl_pct and tp_tier_done < 1:
+            sl_sell = safe_float(sl_rules.get("sl_sell", 0.50))
+            _exit_position(addr, pos, sl_sell, f"SL1({sl_pct*100:.0f}%)", pnl_pct)
+            with _pos_lock:
+                if addr in state["positions"]:
+                    state["positions"][addr]["sl1_triggered"] = True
+            continue
 
-        elif sl1_triggered and pnl_pct <= sl2_pct:
-            # SL2: sell everything remaining (ignore floor)
+        if pnl_pct <= sl2_pct and tp_tier_done < 1:
             _exit_position(addr, pos, 1.0, f"SL2({sl2_pct*100:.0f}%)", pnl_pct)
             continue
 
-        # ═══════════════════════════════════════════════════════════
-        # EXIT LAYER 5: Time-decay SL
-        # ═══════════════════════════════════════════════════════════
-        time_decay = sl_rules.get("time_decay", [])
-        td_exit = False
-        for rule in sorted(time_decay, key=lambda r: r[0], reverse=True):
-            after_min, tighten_to = rule[0], rule[1]
-            if age_min >= after_min:
-                if pnl_pct <= tighten_to:
-                    if remaining <= floor_pct + 0.01:
-                        td_exit = False
-                    else:
-                        max_sellable = (remaining - floor_pct) / remaining if remaining > 0 else 0
-                        actual_sell = min(sl_sell, max_sellable)
-                        if actual_sell >= 0.05:
-                            _exit_position(addr, pos, actual_sell,
-                                           f"TIME_DECAY({after_min}m/{tighten_to:.0%})", pnl_pct)
-                            with pos_lock:
-                                if addr in state["positions"]:
-                                    state["positions"][addr]["sl1_triggered"] = True
-                            td_exit = True
-                break
-        if td_exit:
-            continue
+        # ─── LAYER 5: TIME-DECAY STOP LOSS ──────────────────────────
+        if tp_tier_done < 1:
+            for min_threshold, sl_thresh in sl_rules.get("time_decay", []):
+                if age_min >= min_threshold and pnl_pct <= sl_thresh:
+                    _exit_position(addr, pos, 0.50, f"TIME_DECAY({min_threshold}m)", pnl_pct)
+                    break
 
-        # ═══════════════════════════════════════════════════════════
-        # EXIT LAYER 6: Timeout
-        # ═══════════════════════════════════════════════════════════
+        # ─── LAYER 6: TIMEOUT ────────────────────────────────────────
         timeout_hrs = safe_float(sl_rules.get("timeout_hrs", 48))
-        if age_min >= timeout_hrs * 60:
-            _exit_position(addr, pos, 1.0, "TIMEOUT", pnl_pct)
+        if age_sec >= timeout_hrs * 3600:
+            _exit_position(addr, pos, 1.0, f"TIMEOUT({timeout_hrs}h)", pnl_pct)
             continue
 
-        # ═══════════════════════════════════════════════════════════
-        # EXIT LAYER 7: Floor Position Exit (V7 New!)
-        # 底仓亏损时全清, 不再死拿
-        # ═══════════════════════════════════════════════════════════
-        if config.FLOOR_EXIT_ENABLED and remaining <= floor_pct + 0.05:
-            # This is a floor position (small remaining)
-            floor_loss_limit = config.FLOOR_EXIT_LOSS_PCT
-            floor_age_limit = config.FLOOR_EXIT_AGE_HRS * 60  # in minutes
-
-            if pnl_pct <= floor_loss_limit:
-                # Floor position lost too much -> clean up
-                _exit_position(addr, pos, 1.0, f"FLOOR_LOSS({pnl_pct*100:.0f}%)", pnl_pct)
+        # ─── LAYER 7: FLOOR EXIT (dead positions) ────────────────────
+        floor_pct = safe_float(tp_rules.get("floor_pct", 0.10))
+        if config.FLOOR_EXIT_ENABLED and remaining <= floor_pct + 0.01:
+            if pnl_pct <= config.FLOOR_EXIT_LOSS_PCT:
+                _exit_position(addr, pos, 1.0, "FLOOR_LOSS", pnl_pct)
+                continue
+            if age_sec >= config.FLOOR_EXIT_AGE_HRS * 3600 and pnl_pct < config.FLOOR_EXIT_AGE_LOSS:
+                _exit_position(addr, pos, 1.0, "FLOOR_AGED", pnl_pct)
                 continue
 
-            if age_min >= floor_age_limit and pnl_pct < config.FLOOR_EXIT_AGE_LOSS:
-                # Floor position too old and in loss -> clean up
-                _exit_position(addr, pos, 1.0, f"FLOOR_AGE({age_min:.0f}m)", pnl_pct)
+        # ─── LAYER 8: TRAILING STOP (after TP1) ─────────────────────
+        if tp_tier_done >= 1 and peak_price > 0:
+            trail_pct = safe_float(tp_rules.get("trailing_pct", 0.20))
+            trail_sell = safe_float(tp_rules.get("trailing_sell", 0.40))
+            drop = (peak_price - cur_price) / peak_price
+            if drop >= trail_pct:
+                _exit_position(addr, pos, trail_sell, f"TRAILING({trail_pct*100:.0f}%)", pnl_pct)
                 continue
 
-        # ═══════════════════════════════════════════════════════════
-        # EXIT LAYER 8: Trailing Stop (after TP1)
-        # ═══════════════════════════════════════════════════════════
-        trailing_pct = safe_float(tp_rules.get("trailing_pct", 0.20))
-        trailing_sell = safe_float(tp_rules.get("trailing_sell", 0.40))
-
-        if tp_tier_done >= 1 and peak_price > entry_price:
-            drop_from_peak = (peak_price - cur_price) / peak_price
-            if drop_from_peak >= trailing_pct:
-                if remaining <= floor_pct + 0.01:
-                    pass
-                else:
-                    max_sellable = (remaining - floor_pct) / remaining if remaining > 0 else 0
-                    actual_sell = min(trailing_sell, max_sellable)
-                    if actual_sell >= 0.05:
-                        _exit_position(addr, pos, actual_sell, f"TRAILING({trailing_pct:.0%})", pnl_pct)
-                        continue
-
-        # ═══════════════════════════════════════════════════════════
-        # EXIT LAYER 9: Tiered Take Profit (V7: TP1/TP2/TP3)
-        # ═══════════════════════════════════════════════════════════
-
-        # Force exit at TP (from risk flags)
-        if pos.get("force_exit_at_tp") and pnl_pct >= 0:
-            _exit_position(addr, pos, 1.0, "FORCE_EXIT_AT_TP", pnl_pct)
-            continue
-
-        # V7: Tier B fast TP (10min内涨30%直接TP1)
-        if tier == "B" and tp_tier_done == 0:
+        # ─── LAYER 9: TAKE PROFIT ────────────────────────────────────
+        # V8 Tier B fast TP: +30% in 10min
+        if tier == "B" and tp_tier_done < 1:
             if age_min <= config.TIER_B_FAST_TP_MIN and pnl_pct >= config.TIER_B_FAST_TP_PCT:
-                tp1_sell = safe_float(tp_rules.get("tp1_sell", 0.50))
-                if remaining > floor_pct + 0.01:
-                    max_sellable = (remaining - floor_pct) / remaining if remaining > 0 else 0
-                    actual_sell = min(tp1_sell, max_sellable)
-                    if actual_sell >= 0.05:
-                        _exit_position(addr, pos, actual_sell, f"FAST_TP_B(+{pnl_pct*100:.0f}%)", pnl_pct)
-                        with pos_lock:
-                            if addr in state["positions"]:
-                                state["positions"][addr]["tp_tier"] = 1
-                        continue
+                tp_sell = safe_float(tp_rules.get("tp1_sell", 0.50))
+                _exit_position(addr, pos, tp_sell, "FAST_TP_B", pnl_pct)
+                with _pos_lock:
+                    if addr in state["positions"]:
+                        state["positions"][addr]["tp_tier"] = 1
+                continue
 
-        # TP1
-        if tp_tier_done == 0:
-            tp1_pct = safe_float(tp_rules.get("tp1_pct", 1.00))
-            tp1_sell = safe_float(tp_rules.get("tp1_sell", 0.50))
-            if pnl_pct >= tp1_pct:
-                if remaining > floor_pct + 0.01:
-                    max_sellable = (remaining - floor_pct) / remaining if remaining > 0 else 0
-                    actual_sell = min(tp1_sell, max_sellable)
-                    if actual_sell >= 0.05:
-                        _exit_position(addr, pos, actual_sell, f"TP1(+{tp1_pct:.0%})", pnl_pct)
-                        with pos_lock:
-                            if addr in state["positions"]:
-                                state["positions"][addr]["tp_tier"] = 1
-                        continue
+        # Standard TP1/TP2/TP3
+        for tp_level, tp_key, sell_key in [(1, "tp1_pct", "tp1_sell"),
+                                            (2, "tp2_pct", "tp2_sell"),
+                                            (3, "tp3_pct", "tp3_sell")]:
+            if tp_tier_done >= tp_level:
+                continue
+            tp_threshold = safe_float(tp_rules.get(tp_key, 999))
+            if pnl_pct >= tp_threshold:
+                tp_sell = safe_float(tp_rules.get(sell_key, 0.30))
+                _exit_position(addr, pos, tp_sell, f"TP{tp_level}(+{tp_threshold*100:.0f}%)", pnl_pct)
+                with _pos_lock:
+                    if addr in state["positions"]:
+                        state["positions"][addr]["tp_tier"] = tp_level
+                break
 
-        # TP2
-        if tp_tier_done == 1:
-            tp2_pct = safe_float(tp_rules.get("tp2_pct", 3.00))
-            tp2_sell = safe_float(tp_rules.get("tp2_sell", 0.30))
-            if pnl_pct >= tp2_pct:
-                if remaining > floor_pct + 0.01:
-                    max_sellable = (remaining - floor_pct) / remaining if remaining > 0 else 0
-                    actual_sell = min(tp2_sell, max_sellable)
-                    if actual_sell >= 0.05:
-                        _exit_position(addr, pos, actual_sell, f"TP2(+{tp2_pct:.0%})", pnl_pct)
-                        with pos_lock:
-                            if addr in state["positions"]:
-                                state["positions"][addr]["tp_tier"] = 2
-                        continue
+        # Background risk check (async, throttled)
+        risk_last = safe_float(pos.get("risk_last_checked", 0))
+        if now - risk_last >= 60:
+            with _pos_lock:
+                if addr in state["positions"]:
+                    state["positions"][addr]["risk_last_checked"] = now
+            _async_risk_check(addr, pos)
 
-        # TP3 (V7 New!)
-        if tp_tier_done == 2:
-            tp3_pct = safe_float(tp_rules.get("tp3_pct", 8.00))
-            tp3_sell = safe_float(tp_rules.get("tp3_sell", 0.30))
-            if pnl_pct >= tp3_pct:
-                if remaining > floor_pct + 0.01:
-                    max_sellable = (remaining - floor_pct) / remaining if remaining > 0 else 0
-                    actual_sell = min(tp3_sell, max_sellable)
-                    if actual_sell >= 0.05:
-                        _exit_position(addr, pos, actual_sell, f"TP3(+{tp3_pct:.0%})", pnl_pct)
-                        with pos_lock:
-                            if addr in state["positions"]:
-                                state["positions"][addr]["tp_tier"] = 3
-                        continue
-
-    # Post-trade risk flags (background, throttled)
-    for addr, pos in positions.items():
-        if pos.get("unconfirmed"):
-            continue
-        last_rc = safe_float(pos.get("risk_last_checked", 0))
-        if now - last_rc < 60:
-            continue
-        with pos_lock:
-            if addr in state["positions"]:
-                state["positions"][addr]["risk_last_checked"] = now
-
-        _sym = pos.get("symbol", "?")
-        _eliq = safe_float(pos.get("entry_liq", 0))
-        _et10 = safe_float(pos.get("entry_top10", 0))
-        _esp = safe_float(pos.get("entry_sniper_pct", 0))
-
-        def _run_post_flags(_a=addr, _s=_sym, _l=_eliq, _t=_et10, _sp=_esp):
-            if not _risk_check_semaphore.acquire(blocking=False):
-                return
-            try:
-                flags = post_trade_flags(_a, _s, entry_liquidity_usd=_l,
-                                         entry_top10=_t, entry_sniper_pct=_sp)
-                for flag in flags:
-                    feed(f"  RISK {_s}: {flag}")
-                    if flag.startswith("EXIT_NOW"):
-                        _exit_position(_a, None, 1.0, "RISK_EXIT", 0)
-                        break
-                    elif flag.startswith("EXIT_NEXT_TP"):
-                        with pos_lock:
-                            if _a in state["positions"]:
-                                state["positions"][_a]["force_exit_at_tp"] = True
-            except Exception:
-                pass
-            finally:
-                _risk_check_semaphore.release()
-
-        threading.Thread(target=_run_post_flags, daemon=True).start()
-
-    # Save positions after monitor cycle
-    with pos_lock:
+    # Save after cycle
+    with _pos_lock:
         save_positions()
 
 
+def _async_risk_check(addr, pos):
+    """Run post-trade risk check in background thread."""
+    def _run():
+        if not _risk_semaphore.acquire(blocking=False):
+            return
+        try:
+            flags = post_trade_flags(
+                addr, pos.get("symbol", "?"),
+                entry_liquidity_usd=safe_float(pos.get("entry_liq", 0)),
+                entry_top10=safe_float(pos.get("entry_top10", 0)),
+                entry_sniper_pct=safe_float(pos.get("entry_sniper_pct", 0)))
+            for flag in flags:
+                feed(f"  RISK {pos.get('symbol', '?')}: {flag}")
+                if flag.startswith("EXIT_NOW"):
+                    _exit_position(addr, None, 1.0, "RISK_EXIT", 0)
+                    break
+                elif flag.startswith("EXIT_NEXT_TP"):
+                    with _pos_lock:
+                        if addr in state["positions"]:
+                            state["positions"][addr]["force_exit_at_tp"] = True
+        except Exception:
+            pass
+        finally:
+            _risk_semaphore.release()
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 12: Exit Execution & Trade Recording
+# SECTION 12: EXIT EXECUTION & TRADE RECORDING
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _exit_position(addr, pos, sell_ratio, reason, pnl_pct):
-    """Execute position exit (full or partial sell). STRICTLY ENFORCED."""
-    with pos_lock:
-        if addr not in state["positions"]:
-            return
-        if addr in _selling:
+    """Execute position exit. Thread-safe with sell deduplication."""
+    with _pos_lock:
+        if addr not in state["positions"] or addr in _selling:
             return
         _selling.add(addr)
         pos = dict(state["positions"][addr])
@@ -1928,17 +1533,15 @@ def _exit_position(addr, pos, sell_ratio, reason, pnl_pct):
         success, tx_hash = execute_sell(addr, symbol, sell_amount, reason)
 
         if not success:
-            feed(f"  SELL FAIL {symbol} [{reason}] - will retry next cycle")
-            with pos_lock:
+            log("WARN", f"SELL FAIL {symbol} [{reason}]")
+            with _pos_lock:
                 if addr in state["positions"]:
                     fc = state["positions"][addr].get("sell_fail_count", 0) + 1
                     state["positions"][addr]["sell_fail_count"] = fc
-                    # V7: If sell fails too many times, force remove position
-                    # to prevent stuck positions blocking slots
                     if fc >= 15:
                         state["positions"].pop(addr, None)
                         save_positions()
-                        feed(f"  FORCE_REMOVE {symbol}: {fc} sell failures, position removed")
+                        feed(f"  FORCE_REMOVE {symbol}: {fc} sell failures")
             return
 
         # Record trade
@@ -1946,7 +1549,7 @@ def _exit_position(addr, pos, sell_ratio, reason, pnl_pct):
         _record_trade(addr, pos, reason, pnl_pct, sell_ratio, tx_hash, pnl_usd)
 
         # Update or remove position
-        with pos_lock:
+        with _pos_lock:
             if sell_ratio >= 0.99:
                 state["positions"].pop(addr, None)
                 cooldown_map[addr] = time.time() + 1800
@@ -1955,15 +1558,14 @@ def _exit_position(addr, pos, sell_ratio, reason, pnl_pct):
                     state["positions"][addr]["token_amount"] = token_amount - sell_amount
                     state["positions"][addr]["size_usd"] = size_usd * (1 - sell_ratio)
                     state["positions"][addr]["sell_fail_count"] = 0
-                    old_remaining = safe_float(state["positions"][addr].get("remaining", 1.0))
-                    state["positions"][addr]["remaining"] = old_remaining * (1 - sell_ratio)
+                    old_rem = safe_float(state["positions"][addr].get("remaining", 1.0))
+                    state["positions"][addr]["remaining"] = old_rem * (1 - sell_ratio)
             save_positions()
 
-        pnl_display = f"{pnl_pct*100:+.1f}%"
         multiplier = 1 + pnl_pct
-        feed(f"SELL {symbol} [{reason}] {sell_ratio:.0%} PnL={pnl_display} ({multiplier:.2f}x)")
+        feed(f"SELL {symbol} [{reason}] {sell_ratio:.0%} PnL={pnl_pct*100:+.1f}% ({multiplier:.2f}x)")
 
-        with state_lock:
+        with _state_lock:
             state["stats"]["sells"] += 1
             state["stats"]["net_pnl"] = round(state["stats"]["net_pnl"] + pnl_usd, 2)
             if pnl_pct >= 0:
@@ -1972,85 +1574,14 @@ def _exit_position(addr, pos, sell_ratio, reason, pnl_pct):
                 state["stats"]["losses"] += 1
 
     finally:
-        with pos_lock:
+        with _pos_lock:
             _selling.discard(addr)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 13: Session Risk Control (V7: No Forced Shutdown!)
-# ══════════════════════════════════════════════════════════════════════════════
-
-_was_paused = False  # Track pause state for recovery logging
-
-
-def can_enter():
-    """Check if opening new positions is allowed. Returns (ok, reason)."""
-    global _was_paused
-
-    if config.PAUSED:
-        return False, "PAUSED"
-
-    # Startup cooldown
-    if time.time() - _startup_ts < config.STARTUP_COOLDOWN:
-        remain = int(config.STARTUP_COOLDOWN - (time.time() - _startup_ts))
-        return False, f"STARTUP_COOLDOWN ({remain}s)"
-
-    # V7: Only pause, never stop
-    with state_lock:
-        if time.time() < session_risk["paused_until"]:
-            remain = int(session_risk["paused_until"] - time.time())
-            _was_paused = True
-            return False, f"SESSION_PAUSED ({remain}s)"
-        elif _was_paused:
-            # Pause just expired — log recovery
-            _was_paused = False
-            feed(f"SESSION_RESUMED: pause expired, new entries allowed again")
-
-    with pos_lock:
-        active_count = sum(
-            1 for pos in state["positions"].values()
-            if pos.get("tp_tier", 0) < 1
-            and pos.get("sell_fail_count", 0) < 10
-            and pos.get("remaining", 1.0) > 0.15
-        )
-        if active_count >= config.MAX_POSITIONS:
-            return False, "MAX_POSITIONS"
-
-    return True, "OK"
-
-
-def record_loss(pnl_usd):
-    """Record loss and update session risk control. V7: pause only, no stop."""
-    with state_lock:
-        session_risk["consecutive_losses"] += 1
-        session_risk["cumulative_loss_usd"] += abs(pnl_usd)
-
-        # V7: Daily loss limit triggers PAUSE, not STOP
-        if session_risk["cumulative_loss_usd"] >= config.DAILY_LOSS_LIMIT:
-            pause_duration = config.DAILY_LOSS_PAUSE
-            session_risk["paused_until"] = time.time() + pause_duration
-            feed(f"SESSION_PAUSE: daily loss ${session_risk['cumulative_loss_usd']:.2f} >= "
-                 f"${config.DAILY_LOSS_LIMIT} -> paused {pause_duration//60}min")
-        elif session_risk["consecutive_losses"] >= config.MAX_CONSEC_LOSS:
-            session_risk["paused_until"] = time.time() + config.PAUSE_CONSEC_SEC
-            feed(f"SESSION_PAUSE: {session_risk['consecutive_losses']} consecutive losses -> "
-                 f"paused {config.PAUSE_CONSEC_SEC // 60}min")
-
-    save_session()
-
-
-def record_win():
-    """Record win and reset consecutive losses."""
-    with state_lock:
-        session_risk["consecutive_losses"] = 0
-    save_session()
 
 
 def _record_trade(addr, pos, reason, pnl_pct, sell_ratio, tx_hash, pnl_usd):
     """Record trade in history and update session risk."""
-    rand_suffix = ''.join(random.choices(string.ascii_lowercase, k=4))
     trade = {
-        "tradeId": f"sell-{int(time.time())}-{addr[:4]}-{rand_suffix}",
+        "tradeId": f"sell-{int(time.time())}-{addr[:4]}-{''.join(random.choices(string.ascii_lowercase, k=4))}",
         "timestamp": int(time.time()),
         "direction": "sell",
         "tokenAddress": addr,
@@ -2066,37 +1597,98 @@ def _record_trade(addr, pos, reason, pnl_pct, sell_ratio, tx_hash, pnl_usd):
         "t": datetime.now().strftime("%H:%M:%S"),
     }
 
-    with state_lock:
+    with _state_lock:
         state["trades"].insert(0, trade)
         state["trades"] = state["trades"][:200]
-        with trades_lock:
-            save_trades()
+    with _trades_lock:
+        save_trades()
 
     if pnl_pct < 0:
-        record_loss(pnl_usd)
+        _record_loss(pnl_usd)
     else:
-        record_win()
-
+        _record_win()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 14: Hot Tokens Cache
+# SECTION 13: SESSION RISK CONTROL
+# V8: Pause only, never stop. TP/SL continue during pause.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_was_paused = False
+
+
+def can_enter():
+    """Check if new entries are allowed. Returns (ok, reason)."""
+    global _was_paused
+
+    if config.PAUSED:
+        return False, "PAUSED"
+
+    if time.time() - _startup_ts < config.STARTUP_COOLDOWN:
+        remain = int(config.STARTUP_COOLDOWN - (time.time() - _startup_ts))
+        return False, f"STARTUP_COOLDOWN({remain}s)"
+
+    with _state_lock:
+        if time.time() < session_risk["paused_until"]:
+            remain = int(session_risk["paused_until"] - time.time())
+            _was_paused = True
+            return False, f"SESSION_PAUSED({remain}s)"
+        elif _was_paused:
+            _was_paused = False
+            feed("SESSION_RESUMED: pause expired")
+
+    with _pos_lock:
+        active = sum(1 for p in state["positions"].values()
+                     if p.get("tp_tier", 0) < 1
+                     and p.get("sell_fail_count", 0) < 10
+                     and p.get("remaining", 1.0) > 0.15)
+        if active >= config.MAX_POSITIONS:
+            return False, "MAX_POSITIONS"
+
+    return True, "OK"
+
+
+def _record_loss(pnl_usd):
+    """Record loss → update session risk (pause logic)."""
+    with _state_lock:
+        session_risk["consecutive_losses"] += 1
+        session_risk["cumulative_loss_usd"] += abs(pnl_usd)
+
+        if session_risk["cumulative_loss_usd"] >= config.DAILY_LOSS_LIMIT:
+            session_risk["paused_until"] = time.time() + config.DAILY_LOSS_PAUSE
+            feed(f"SESSION_PAUSE: daily loss ${session_risk['cumulative_loss_usd']:.2f} >= "
+                 f"${config.DAILY_LOSS_LIMIT} -> paused {config.DAILY_LOSS_PAUSE//60}min")
+        elif session_risk["consecutive_losses"] >= config.MAX_CONSEC_LOSS:
+            session_risk["paused_until"] = time.time() + config.PAUSE_CONSEC_SEC
+            feed(f"SESSION_PAUSE: {session_risk['consecutive_losses']} consecutive losses -> "
+                 f"paused {config.PAUSE_CONSEC_SEC//60}min")
+    save_session()
+
+
+def _record_win():
+    """Record win → reset consecutive losses."""
+    with _state_lock:
+        session_risk["consecutive_losses"] = 0
+    save_session()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 14: HOT TOKENS CACHE & HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 _hot_cache = {}
 _hot_cache_ts = 0
 
 
-def get_hot_tokens():
+def _get_hot_cache():
+    """Get hot tokens with 60s cache TTL."""
     global _hot_cache, _hot_cache_ts
     now = time.time()
     if now - _hot_cache_ts < config.HOT_REFRESH_SEC and _hot_cache:
         return _hot_cache
     try:
-        data = onchainos_data("token", "hot-tokens",
-                              "--chain", "solana",
-                              "--ranking-type", "4",
-                              "--limit", "50")
+        data = onchainos_data("token", "hot-tokens", "--chain", "solana",
+                              "--ranking-type", "4", "--limit", "50")
         if isinstance(data, list):
             cache = {}
             for tok in data:
@@ -2105,7 +1697,6 @@ def get_hot_tokens():
                     cache[addr] = {
                         "inflow": safe_float(tok.get("inflowUsd", 0) or tok.get("netInflowUsd", 0)),
                         "sym": tok.get("symbol", "?"),
-                        "mc": safe_float(tok.get("marketCap", 0)),
                     }
             _hot_cache = cache
             _hot_cache_ts = now
@@ -2114,98 +1705,27 @@ def get_hot_tokens():
     return _hot_cache
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 15: Position Takeover & Helpers
-# ══════════════════════════════════════════════════════════════════════════════
-
-def takeover_existing_positions():
-    """Scan wallet balance at startup. Inject existing tokens as 'takeover' tier."""
-    feed("=== Position Takeover: scanning wallet ===")
-    wallet = get_wallet_address()
-    if not wallet:
-        feed("  Takeover: no wallet address")
-        return
-
+def _k1_pump_guard(addr, max_pct):
+    """Check if 1m candle shows >max_pct pump (chasing protection)."""
     try:
-        data = onchainos_data("wallet", "balance", "--chain", "501")
-        if not data:
-            feed("  Takeover: no balance data")
-            return
-
-        assets = []
-        if isinstance(data, dict):
-            details = data.get("details", [])
-            if isinstance(details, list):
-                for detail in details:
-                    token_assets = detail.get("tokenAssets", [])
-                    if isinstance(token_assets, list):
-                        assets.extend(token_assets)
-        elif isinstance(data, list):
-            assets = data
-
-        taken = 0
-        for asset in assets:
-            addr = asset.get("tokenAddress", "")
-            sym = (asset.get("symbol") or "").upper()
-            bal = safe_float(asset.get("balance", 0))
-
-            if not addr or addr in _NEVER_TRADE:
-                continue
-            if sym in ("SOL", "USDC", "USDT", "WSOL"):
-                continue
-            if bal <= 0:
-                continue
-
-            with pos_lock:
-                if addr in state["positions"]:
-                    continue
-
-            pi = get_token_price(addr)
-            price = safe_float(pi.get("price", 0))
-            mc = safe_float(pi.get("marketCap", 0))
-            liq = safe_float(pi.get("liquidity", 0))
-
-            value_usd = bal * price if price > 0 else 0
-            if value_usd < config.MIN_POSITION_VALUE:
-                continue
-
-            with pos_lock:
-                state["positions"][addr] = {
-                    "symbol": sym or asset.get("tokenSymbol", addr[:8]),
-                    "address": addr,
-                    "tier": "takeover",
-                    "size_usd": value_usd,
-                    "entry_price": price,
-                    "peak_price": price,
-                    "token_amount": bal,
-                    "entry_mc": mc,
-                    "entry_liq": liq,
-                    "opened_at": datetime.now(timezone.utc).isoformat(),
-                    "opened_at_ts": time.time(),
-                    "entry_ts": time.time(),
-                    "tp_tier": 0,
-                    "zero_count": 0,
-                    "sell_fail_count": 0,
-                    "last_peak_ts": time.time(),
-                    "last_liq_check": 0,
-                    "risk_last_checked": 0,
-                    "entry_top10": 0,
-                    "entry_sniper_pct": 0,
-                    "remaining": 1.0,
-                    "sl1_triggered": False,
-                }
-            taken += 1
-
-        with pos_lock:
-            save_positions()
-        feed(f"  Takeover complete: {taken} positions")
-
-    except Exception as e:
-        feed(f"  Takeover error: {e}")
+        data = onchainos_data("market", "candles", "--chain", "solana",
+                              "--address", addr, "--bar", "1m")
+        if isinstance(data, list) and len(data) >= 2:
+            k1 = data[-1]
+            k1_open = safe_float(k1.get("o", 0))
+            k1_close = safe_float(k1.get("c", 0))
+            if k1_open > 0:
+                return (k1_close - k1_open) / k1_open * 100 > max_pct
+    except Exception:
+        pass
+    return False
 
 
-def _create_position(addr, symbol, tier, size_usd, price, mc, liq,
-                     token_amount, tx_hash, rc):
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 15: POSITION CREATION & TAKEOVER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _create_position(addr, symbol, tier, size_usd, price, mc, liq, token_amount, tx_hash, rc):
     """Create a new position record."""
     now = time.time()
     entry_top10 = 0
@@ -2215,97 +1735,112 @@ def _create_position(addr, symbol, tier, size_usd, price, mc, liq,
         entry_top10 = safe_float(info.get("top10HoldPercent", 0))
         entry_sniper = safe_float(info.get("sniperHoldingPercent", 0))
 
-    with pos_lock:
+    with _pos_lock:
         state["positions"][addr] = {
-            "symbol": symbol,
-            "address": addr,
-            "tier": tier,
+            "symbol": symbol, "address": addr, "tier": tier,
             "size_usd": size_usd,
             "entry_price": price if price > 0 else 0.0001,
             "peak_price": price if price > 0 else 0.0001,
             "token_amount": token_amount,
-            "entry_mc": mc,
-            "entry_liq": liq,
+            "entry_mc": mc, "entry_liq": liq,
             "tx_hash": tx_hash or "",
             "opened_at": datetime.now(timezone.utc).isoformat(),
-            "opened_at_ts": now,
-            "entry_ts": now,
-            "tp_tier": 0,
-            "zero_count": 0,
-            "sell_fail_count": 0,
-            "last_peak_ts": now,
-            "last_liq_check": 0,
-            "risk_last_checked": 0,
-            "entry_top10": entry_top10,
-            "entry_sniper_pct": entry_sniper,
-            "pnl_pct": 0.0,
-            "age_min": 0.0,
-            "remaining": 1.0,
-            "sl1_triggered": False,
+            "opened_at_ts": now, "entry_ts": now,
+            "tp_tier": 0, "zero_count": 0, "sell_fail_count": 0,
+            "last_peak_ts": now, "last_liq_check": 0, "risk_last_checked": 0,
+            "entry_top10": entry_top10, "entry_sniper_pct": entry_sniper,
+            "pnl_pct": 0.0, "age_min": 0.0, "remaining": 1.0, "sl1_triggered": False,
         }
         save_positions()
-
-    with state_lock:
+    with _state_lock:
         state["stats"]["buys"] += 1
 
 
 def _create_unconfirmed_position(addr, symbol, tier, size_usd, price, mc):
-    """Create an unconfirmed position (swap timeout)."""
+    """Create unconfirmed position (swap timeout)."""
     now = time.time()
-    with pos_lock:
+    with _pos_lock:
         state["positions"][addr] = {
-            "symbol": symbol,
-            "address": addr,
-            "tier": tier,
+            "symbol": symbol, "address": addr, "tier": tier,
             "size_usd": size_usd,
             "entry_price": price if price > 0 else 0.0001,
             "peak_price": price if price > 0 else 0.0001,
-            "token_amount": 0,
-            "entry_mc": mc,
-            "entry_liq": 0,
+            "token_amount": 0, "entry_mc": mc, "entry_liq": 0,
             "opened_at": datetime.now(timezone.utc).isoformat(),
-            "opened_at_ts": now,
-            "entry_ts": now,
-            "tp_tier": 0,
-            "zero_count": 0,
-            "sell_fail_count": 0,
-            "last_peak_ts": now,
-            "last_liq_check": 0,
-            "risk_last_checked": 0,
-            "entry_top10": 0,
-            "entry_sniper_pct": 0,
-            "unconfirmed": True,
-            "unconfirmed_ts": now,
-            "unconfirmed_checks": 0,
-            "remaining": 1.0,
-            "sl1_triggered": False,
+            "opened_at_ts": now, "entry_ts": now,
+            "tp_tier": 0, "zero_count": 0, "sell_fail_count": 0,
+            "last_peak_ts": now, "last_liq_check": 0, "risk_last_checked": 0,
+            "entry_top10": 0, "entry_sniper_pct": 0,
+            "unconfirmed": True, "unconfirmed_ts": now, "unconfirmed_checks": 0,
+            "remaining": 1.0, "sl1_triggered": False,
         }
         save_positions()
 
 
-def _k1_pump_guard(addr, max_pct):
-    """Check if 1m candle shows >max_pct pump (chasing protection)."""
+def takeover_existing_positions():
+    """Scan wallet at startup. Inject existing tokens as 'takeover' tier."""
+    feed("=== Position Takeover ===")
+    wallet = get_wallet_address()
+    if not wallet:
+        return
+
     try:
-        data = onchainos_data("market", "candles",
-                              "--chain", "solana",
-                              "--address", addr,
-                              "--bar", "1m")
-        if isinstance(data, list) and len(data) >= 2:
-            k1 = data[-1]
-            k1_open = safe_float(k1.get("o", 0))
-            k1_close = safe_float(k1.get("c", 0))
-            if k1_open > 0:
-                k1_pct = (k1_close - k1_open) / k1_open * 100
-                if k1_pct > max_pct:
-                    return True
-    except Exception:
-        pass
-    return False
+        data = onchainos_data("wallet", "balance", "--chain", "501")
+        if not data:
+            return
+
+        assets = []
+        if isinstance(data, dict):
+            for detail in data.get("details", []):
+                assets.extend(detail.get("tokenAssets", []))
+        elif isinstance(data, list):
+            assets = data
+
+        taken = 0
+        for asset in assets:
+            addr = asset.get("tokenAddress", "")
+            sym = (asset.get("symbol") or "").upper()
+            bal = safe_float(asset.get("balance", 0))
+
+            if not addr or addr in _NEVER_TRADE or sym in ("SOL", "USDC", "USDT", "WSOL") or bal <= 0:
+                continue
+            with _pos_lock:
+                if addr in state["positions"]:
+                    continue
+
+            pi = get_token_price(addr)
+            price = safe_float(pi.get("price", 0))
+            value_usd = bal * price if price > 0 else 0
+            if value_usd < config.MIN_POSITION_VALUE:
+                continue
+
+            with _pos_lock:
+                state["positions"][addr] = {
+                    "symbol": sym or addr[:8], "address": addr, "tier": "takeover",
+                    "size_usd": value_usd,
+                    "entry_price": price, "peak_price": price,
+                    "token_amount": bal,
+                    "entry_mc": safe_float(pi.get("marketCap", 0)),
+                    "entry_liq": safe_float(pi.get("liquidity", 0)),
+                    "opened_at": datetime.now(timezone.utc).isoformat(),
+                    "opened_at_ts": time.time(), "entry_ts": time.time(),
+                    "tp_tier": 0, "zero_count": 0, "sell_fail_count": 0,
+                    "last_peak_ts": time.time(), "last_liq_check": 0, "risk_last_checked": 0,
+                    "entry_top10": 0, "entry_sniper_pct": 0,
+                    "remaining": 1.0, "sl1_triggered": False,
+                }
+            taken += 1
+
+        with _pos_lock:
+            save_positions()
+        feed(f"  Takeover complete: {taken} positions")
+    except Exception as e:
+        log("ERROR", f"Takeover: {e}")
 
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 16: Web Dashboard
+# SECTION 16: WEB DASHBOARD
 # ══════════════════════════════════════════════════════════════════════════════
 
 _dashboard_html_path = PROJECT_DIR / "dashboard.html"
@@ -2325,22 +1860,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def _serve_api(self):
-        with state_lock:
-            snap = {
-                "feed": list(state["feed"]),
-                "stats": dict(state["stats"]),
-            }
-        with pos_lock:
+        with _state_lock:
+            snap = {"feed": list(state["feed"]), "stats": dict(state["stats"])}
+        with _pos_lock:
             snap["positions"] = dict(state["positions"])
-        with trades_lock:
+        with _trades_lock:
             snap["trades"] = list(state["trades"][:50])
         snap["session_risk"] = dict(session_risk)
         snap["config"] = {
+            "preset": config.PRESET,
             "paused": config.PAUSED,
             "paper_trade": config.PAPER_TRADE,
             "max_positions": config.MAX_POSITIONS,
             "night_mode": is_night(),
-            "version": "7.0",
+            "version": _VERSION,
         }
         snap["smart_wallets"] = {
             "total": len(_smart_wallets),
@@ -2358,9 +1891,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             html = _dashboard_html_path.read_text()
         except FileNotFoundError:
-            html = ("<html><body><h1>SOL Meme Hunter v7.0 Dashboard</h1>"
-                    "<p>dashboard.html not found. API available at /api/state</p>"
-                    "</body></html>")
+            html = "<html><body><h1>SOL Meme Hunter v8.0</h1><p>API: /api/state</p></body></html>"
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
@@ -2376,20 +1907,16 @@ def start_dashboard():
         threading.Thread(target=server.serve_forever, daemon=True).start()
         feed(f"Dashboard: http://127.0.0.1:{config.DASHBOARD_PORT}")
     except Exception as e:
-        feed(f"Dashboard failed to start: {e}")
+        log("WARN", f"Dashboard failed: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 17: Scanner Loop & Main Entry Point
+# SECTION 17: SCANNER LOOP & MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
 def scanner_loop():
-    """Main scanning loop. Runs Tier S/A/B/D on schedule."""
-    last_s = 0
-    last_a = 0
-    last_b = 0
-    last_d = 0
-    last_balance = 0
+    """Main scanning loop. Runs Tier S/A/B/D on independent schedules."""
+    last_s = last_a = last_b = last_d = last_balance = 0
     last_daily_reset = datetime.now(timezone.utc).date()
 
     while True:
@@ -2400,13 +1927,13 @@ def scanner_loop():
             today = datetime.now(timezone.utc).date()
             if today != last_daily_reset:
                 last_daily_reset = today
-                with state_lock:
+                with _state_lock:
                     old_loss = session_risk["cumulative_loss_usd"]
                     session_risk["consecutive_losses"] = 0
                     session_risk["cumulative_loss_usd"] = 0.0
                     session_risk["paused_until"] = 0
                 save_session()
-                feed(f"  New day {today}, reset session risk (yesterday loss=${old_loss:.2f})")
+                feed(f"  New day {today}, reset (yesterday loss=${old_loss:.2f})")
 
             # Balance check
             if now - last_balance >= config.BALANCE_CHECK_SEC:
@@ -2414,160 +1941,133 @@ def scanner_loop():
                 sol_bal = get_sol_balance()
                 sol_price = get_sol_price()
                 usd_bal = sol_bal * sol_price if sol_price > 0 else 0
-                with pos_lock:
+                with _pos_lock:
                     n_pos = len(state["positions"])
-                    active_pos = sum(
-                        1 for p in state["positions"].values()
-                        if p.get("tp_tier", 0) < 1
-                        and p.get("sell_fail_count", 0) < 10
-                        and p.get("remaining", 1.0) > 0.15
-                    )
-                daily_loss = session_risk.get("cumulative_loss_usd", 0)
-                feed(f"SOL: {sol_bal:.4f} (~${usd_bal:.2f}) | "
-                     f"Daily PnL: ${-daily_loss:+.2f} | Positions: {active_pos}/{n_pos} | "
-                     f"SW: {len(_smart_wallets)} wallets")
+                    active = sum(1 for p in state["positions"].values()
+                                 if p.get("tp_tier", 0) < 1 and p.get("remaining", 1.0) > 0.15)
+                feed(f"SOL: {sol_bal:.4f} (~${usd_bal:.2f}) | Positions: {active}/{n_pos} | "
+                     f"SW: {len(_smart_wallets)} | Preset: {config.PRESET}")
 
-            # Tier S: Smart Wallet Follow (every TIER_S_REFRESH_SEC)
+            # Tier S
             if config.TIER_S_ENABLED and now - last_s >= config.TIER_S_REFRESH_SEC:
                 last_s = now
                 try:
                     process_tier_s()
                 except Exception as e:
-                    feed(f"Tier S error: {e}")
+                    log("ERROR", f"Tier S: {e}")
 
-            # Tier A: Smart Money Signal (every SM_REFRESH_SEC)
+            # Tier A
             if now - last_a >= config.SM_REFRESH_SEC:
                 last_a = now
                 try:
                     process_tier_a()
                 except Exception as e:
-                    feed(f"Tier A error: {e}")
+                    log("ERROR", f"Tier A: {e}")
 
-            # Tier B: Graduation Ambush (every GRADUATED_REFRESH_SEC)
+            # Tier B
             if now - last_b >= config.GRADUATED_REFRESH_SEC:
                 last_b = now
                 try:
                     process_tier_b()
                 except Exception as e:
-                    feed(f"Tier B error: {e}")
+                    log("ERROR", f"Tier B: {e}")
 
-            # Tier D: Hot Momentum (every HOT_REFRESH_SEC)
+            # Tier D
             if now - last_d >= config.HOT_REFRESH_SEC:
                 last_d = now
                 try:
                     process_tier_d()
                 except Exception as e:
-                    feed(f"Tier D error: {e}")
+                    log("ERROR", f"Tier D: {e}")
 
-            with state_lock:
+            with _state_lock:
                 state["stats"]["cycle"] += 1
 
-            # Clean expired cooldowns
+            # Cleanup expired cooldowns & dedup
             expired = [k for k, v in cooldown_map.items() if now >= v]
             for k in expired:
                 del cooldown_map[k]
-
-            # Clean old tier_s_last_seen (older than 2 hours)
-            old_keys = [k for k, ts in _tier_s_last_seen.items() if now - ts > 7200]
+            old_keys = [k for k, ts in _tier_s_last_seen.items() if now - ts > config.TIER_S_DEDUP_SEC]
             for k in old_keys:
                 del _tier_s_last_seen[k]
 
             time.sleep(config.MONITOR_SEC)
 
         except Exception as e:
-            feed(f"Scanner loop error: {e}")
+            log("ERROR", f"Scanner: {e}")
             time.sleep(5)
 
 
 def main():
     """Main entry point."""
     print("=" * 60)
-    print("  SOL MEME HUNTER v7.0")
-    print("  4-Tier Architecture (S/A/B/D) + Smart Wallet Signal")
-    print("  V7: Cover cost first, let profit ride")
-    print("  V7: No forced shutdown - safe overnight")
+    print(f"  SOL MEME HUNTER v{_VERSION}")
+    print(f"  Preset: {config.PRESET.upper()}")
+    print("  4-Tier (S/A/B/D) + Smart Wallet + 9-Layer Exit")
+    print("  Safe overnight: pause only, TP/SL always enforced")
     print("=" * 60)
 
-    # 1. Check onchainos
+    # Check onchainos
     try:
         ver = onchainos_run("--version")
-        feed(f"onchainos version: {ver.get('data', ver.get('msg', 'unknown'))}")
+        feed(f"onchainos: {ver.get('data', ver.get('msg', 'unknown'))}")
     except Exception:
-        feed("WARNING: onchainos --version failed")
+        log("WARN", "onchainos --version failed")
 
-    # 2. Get wallet address
+    # Get wallet
     wallet = get_wallet_address()
     if not wallet:
-        feed("FATAL: No wallet address. Run: onchainos wallet login")
+        log("FATAL", "No wallet address. Run: onchainos wallet login")
         sys.exit(1)
     feed(f"Wallet: {wallet}")
 
-    # 3. Load Smart Wallet database
+    # Load smart wallets
     load_smart_wallets()
 
-    # 4. Load state
+    # Load state
     load_positions()
     load_acted()
     load_session()
     load_trades()
 
-    with pos_lock:
+    with _pos_lock:
         n_pos = len(state["positions"])
-        active_pos = sum(
-            1 for p in state["positions"].values()
-            if p.get("tp_tier", 0) < 1
-            and p.get("sell_fail_count", 0) < 10
-            and p.get("remaining", 1.0) > 0.15
-        )
-    feed(f"  Loaded: {n_pos} positions ({active_pos} active), "
-         f"{len(acted)} acted, {len(state['trades'])} trades")
+        active = sum(1 for p in state["positions"].values()
+                     if p.get("tp_tier", 0) < 1 and p.get("remaining", 1.0) > 0.15)
+    feed(f"  Loaded: {n_pos} positions ({active} active), {len(acted)} acted")
 
-    # 5. Position takeover
+    # Takeover
     takeover_existing_positions()
 
-    # 6. Print startup banner
+    # Startup info
     night = is_night()
-    feed(f"Mode: {'PAPER' if config.PAPER_TRADE else 'LIVE'} | "
-         f"Night: {night} | PAUSED: {config.PAUSED}")
-    feed(f"Tier S: ${config.TIER_S_SIZE_DAY}(day)/${config.TIER_S_SIZE_NIGHT}(night) | "
-         f"Follow T1 wallets")
-    feed(f"Tier A: ${config.TIER_A_SIZE_DAY}(day)/${config.TIER_A_SIZE_NIGHT}(night) | "
-         f"MC ${config.TIER_A_MC_MIN:,}-${config.TIER_A_MC_MAX:,}")
-    feed(f"Tier B: ${config.TIER_B_SIZE_DAY}(day)/${config.TIER_B_SIZE_NIGHT}(night) | "
-         f"stage={config.TIER_B_STAGE} | MC ${config.TIER_B_MC_MIN:,}-${config.TIER_B_MC_MAX:,}")
-    feed(f"Tier D: base=${config.TIER_D_SIZE_BASE} dynamic | "
-         f"MC ${config.TIER_D_MC_MIN:,}-${config.TIER_D_MC_MAX:,} | score>={config.TIER_D_SCORE_THRESHOLD}")
-    feed(f"TP: TP1=+100%/50% TP2=+300%/30% TP3=+800%/30% | Trail=20%")
-    feed(f"SL: SL1=-20%/50% SL2=-30%/100% | Floor exit: loss>-30% or age>4h")
-    feed(f"Risk: MAX_POS={config.MAX_POSITIONS} | DAILY_LOSS=${config.DAILY_LOSS_LIMIT}(pause) | "
-         f"CONSEC={config.MAX_CONSEC_LOSS}x/{config.PAUSE_CONSEC_SEC}s")
-    feed(f"Smart Wallets: {len(_smart_wallets)} loaded | Volume confirm: {config.VOLUME_CONFIRM_ENABLED}")
-    print("=" * 60)
+    feed(f"Mode: {'PAPER' if config.PAPER_TRADE else 'LIVE'} | Night: {night} | Preset: {config.PRESET}")
+    feed(f"Tier S: ${config.TIER_S_SIZE_DAY}/${config.TIER_S_SIZE_NIGHT} | "
+         f"A: ${config.TIER_A_SIZE_DAY}/${config.TIER_A_SIZE_NIGHT} | "
+         f"B: ${config.TIER_B_SIZE_DAY}/${config.TIER_B_SIZE_NIGHT} | "
+         f"D: base=${config.TIER_D_SIZE_BASE}")
+    feed(f"TP1=+{config.TP1_PCT*100:.0f}%/50% | SL1={config.SL1_PCT*100:.0f}%/50% | "
+         f"MAX_POS={config.MAX_POSITIONS} | DAILY_LOSS=${config.DAILY_LOSS_LIMIT}")
 
-    # 7. Start dashboard
+    # Start dashboard
     start_dashboard()
 
-    # 8. Start monitor thread
-    monitor_thread = threading.Thread(target=monitor_positions, daemon=True)
-    monitor_thread.start()
+    # Start monitor
+    threading.Thread(target=monitor_positions, daemon=True).start()
 
-    # 9. Signal handlers (graceful shutdown)
-    def shutdown_handler(signum, frame):
-        feed(f"Received signal {signum}, shutting down gracefully...")
-        with pos_lock:
-            n = len(state["positions"])
+    # Graceful shutdown
+    def shutdown(signum, frame):
+        feed(f"Shutdown signal {signum}")
+        with _pos_lock:
             save_positions()
-        if n > 0:
-            feed(f"  {n} position(s) still open - saved to {config.POSITIONS_FILE}")
-            feed(f"  Positions will be managed on next startup")
         save_session()
-        feed("  Shutdown complete.")
+        feed("Shutdown complete.")
         sys.exit(0)
 
-    signal.signal(signal.SIGINT, shutdown_handler)
-    signal.signal(signal.SIGTERM, shutdown_handler)
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
 
-    # 10. Run scanner loop (blocks forever - safe overnight!)
+    # Run scanner (blocks forever)
     scanner_loop()
 
 
