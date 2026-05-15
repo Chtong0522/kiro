@@ -44,23 +44,23 @@ _PRESETS = {
         "MAX_CONSEC_LOSS": 3,
         "PAUSE_CONSEC_SEC": 1200,  # 20min
         "DAILY_LOSS_PAUSE": 2400,  # 40min
-        # Filters (tighter)
-        "TIER_A_MC_MIN": 200_000, "TIER_A_MC_MAX": 2_000_000,
-        "TIER_A_LIQ_MIN": 50_000, "TIER_A_HOLDERS_MIN": 300,
-        "TIER_B_MC_MIN": 100_000, "TIER_B_MC_MAX": 400_000,
-        "TIER_B_HOLDERS_MIN": 200,
-        "TIER_D_MC_MIN": 200_000, "TIER_D_MC_MAX": 5_000_000,
-        "TIER_D_LIQ_MIN": 50_000, "TIER_D_SCORE_THRESHOLD": 65,
-        "TIER_S_MC_MIN": 150_000, "TIER_S_MC_MAX": 3_000_000,
-        "TIER_S_LIQ_MIN": 40_000,
-        # Volume
-        "VOLUME_5M_MIN_USD": 12_000,
-        "VOLUME_BUY_SELL_RATIO": 1.4,
-        # Take profit (more conservative TP1)
+        # Filters (strictest: only highest quality entries)
+        "TIER_A_MC_MIN": 300_000, "TIER_A_MC_MAX": 2_000_000,
+        "TIER_A_LIQ_MIN": 60_000, "TIER_A_HOLDERS_MIN": 500,
+        "TIER_B_MC_MIN": 150_000, "TIER_B_MC_MAX": 400_000,
+        "TIER_B_HOLDERS_MIN": 300,
+        "TIER_D_MC_MIN": 300_000, "TIER_D_MC_MAX": 5_000_000,
+        "TIER_D_LIQ_MIN": 60_000, "TIER_D_SCORE_THRESHOLD": 70,
+        "TIER_S_MC_MIN": 200_000, "TIER_S_MC_MAX": 3_000_000,
+        "TIER_S_LIQ_MIN": 50_000,
+        # Volume (strictest)
+        "VOLUME_5M_MIN_USD": 15_000,
+        "VOLUME_BUY_SELL_RATIO": 1.5,
+        # Take profit (higher TP1 = need bigger move to cover cost)
         "TP1_PCT": 1.50, "TP1_SELL": 0.50,
         "TP2_PCT": 3.50, "TP2_SELL": 0.30,
         "TP3_PCT": 8.00, "TP3_SELL": 0.30,
-        # Stop loss (tighter)
+        # Stop loss (tighter = cut losses faster)
         "SL1_PCT": -0.15, "SL1_SELL": 0.50,
         "SL2_PCT": -0.25, "SL2_SELL": 1.0,
     },
@@ -76,18 +76,18 @@ _PRESETS = {
         "MAX_CONSEC_LOSS": 4,
         "PAUSE_CONSEC_SEC": 900,  # 15min
         "DAILY_LOSS_PAUSE": 1800,  # 30min
-        # Filters
-        "TIER_A_MC_MIN": 150_000, "TIER_A_MC_MAX": 3_000_000,
-        "TIER_A_LIQ_MIN": 40_000, "TIER_A_HOLDERS_MIN": 200,
-        "TIER_B_MC_MIN": 80_000, "TIER_B_MC_MAX": 500_000,
-        "TIER_B_HOLDERS_MIN": 150,
-        "TIER_D_MC_MIN": 150_000, "TIER_D_MC_MAX": 10_000_000,
-        "TIER_D_LIQ_MIN": 40_000, "TIER_D_SCORE_THRESHOLD": 55,
-        "TIER_S_MC_MIN": 100_000, "TIER_S_MC_MAX": 5_000_000,
-        "TIER_S_LIQ_MIN": 30_000,
-        # Volume
-        "VOLUME_5M_MIN_USD": 8_000,
-        "VOLUME_BUY_SELL_RATIO": 1.2,
+        # Filters (v8: tightened from v7 for higher quality entries)
+        "TIER_A_MC_MIN": 200_000, "TIER_A_MC_MAX": 3_000_000,
+        "TIER_A_LIQ_MIN": 50_000, "TIER_A_HOLDERS_MIN": 300,
+        "TIER_B_MC_MIN": 100_000, "TIER_B_MC_MAX": 500_000,
+        "TIER_B_HOLDERS_MIN": 200,
+        "TIER_D_MC_MIN": 200_000, "TIER_D_MC_MAX": 8_000_000,
+        "TIER_D_LIQ_MIN": 50_000, "TIER_D_SCORE_THRESHOLD": 60,
+        "TIER_S_MC_MIN": 150_000, "TIER_S_MC_MAX": 5_000_000,
+        "TIER_S_LIQ_MIN": 40_000,
+        # Volume (stricter: must have real activity)
+        "VOLUME_5M_MIN_USD": 10_000,
+        "VOLUME_BUY_SELL_RATIO": 1.3,
         # Take profit
         "TP1_PCT": 1.00, "TP1_SELL": 0.50,
         "TP2_PCT": 3.00, "TP2_SELL": 0.30,
@@ -108,23 +108,23 @@ _PRESETS = {
         "MAX_CONSEC_LOSS": 5,
         "PAUSE_CONSEC_SEC": 600,  # 10min
         "DAILY_LOSS_PAUSE": 1200,  # 20min
-        # Filters (wider)
-        "TIER_A_MC_MIN": 100_000, "TIER_A_MC_MAX": 5_000_000,
-        "TIER_A_LIQ_MIN": 30_000, "TIER_A_HOLDERS_MIN": 150,
-        "TIER_B_MC_MIN": 50_000, "TIER_B_MC_MAX": 800_000,
-        "TIER_B_HOLDERS_MIN": 100,
-        "TIER_D_MC_MIN": 100_000, "TIER_D_MC_MAX": 15_000_000,
-        "TIER_D_LIQ_MIN": 30_000, "TIER_D_SCORE_THRESHOLD": 45,
-        "TIER_S_MC_MIN": 80_000, "TIER_S_MC_MAX": 8_000_000,
-        "TIER_S_LIQ_MIN": 25_000,
-        # Volume
-        "VOLUME_5M_MIN_USD": 5_000,
-        "VOLUME_BUY_SELL_RATIO": 1.0,
+        # Filters (still stricter than v7 aggressive)
+        "TIER_A_MC_MIN": 150_000, "TIER_A_MC_MAX": 5_000_000,
+        "TIER_A_LIQ_MIN": 40_000, "TIER_A_HOLDERS_MIN": 200,
+        "TIER_B_MC_MIN": 80_000, "TIER_B_MC_MAX": 800_000,
+        "TIER_B_HOLDERS_MIN": 150,
+        "TIER_D_MC_MIN": 150_000, "TIER_D_MC_MAX": 12_000_000,
+        "TIER_D_LIQ_MIN": 40_000, "TIER_D_SCORE_THRESHOLD": 50,
+        "TIER_S_MC_MIN": 100_000, "TIER_S_MC_MAX": 8_000_000,
+        "TIER_S_LIQ_MIN": 30_000,
+        # Volume (still requires activity)
+        "VOLUME_5M_MIN_USD": 8_000,
+        "VOLUME_BUY_SELL_RATIO": 1.1,
         # Take profit (earlier TP1 to secure gains faster in volatile markets)
         "TP1_PCT": 0.80, "TP1_SELL": 0.50,
         "TP2_PCT": 2.50, "TP2_SELL": 0.30,
         "TP3_PCT": 6.00, "TP3_SELL": 0.30,
-        # Stop loss (wider)
+        # Stop loss (wider but still disciplined)
         "SL1_PCT": -0.25, "SL1_SELL": 0.50,
         "SL2_PCT": -0.35, "SL2_SELL": 1.0,
     },
@@ -231,8 +231,8 @@ TIER_S_REFRESH_SEC  = 45       # Scan interval
 TIER_S_FOLLOW_TIERS = [1]      # Only follow Tier-1 wallets
 TIER_S_SAMPLE_SIZE  = 10       # Wallets sampled per cycle
 TIER_S_MAX_AGE_MIN  = 30       # Max age of wallet's buy (minutes)
-TIER_S_HOLDERS_MIN  = 100
-TIER_S_TOP10_MAX    = 45.0
+TIER_S_HOLDERS_MIN  = 150
+TIER_S_TOP10_MAX    = 40.0
 TIER_S_DEDUP_SEC    = 7200     # Skip same wallet+token for 2 hours
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -248,8 +248,8 @@ SM_REFRESH_SEC      = 30       # Scan interval
 TIER_A_DEV_RUG      = 0
 TIER_A_BUNDLER_ATH  = 25.0
 TIER_A_LP_BURN_MIN  = 80
-TIER_A_TOP10_MAX    = 45.0
-TIER_A_K1_PUMP_GUARD = 12.0   # Skip if 1m candle pumped >12%
+TIER_A_TOP10_MAX    = 40.0
+TIER_A_K1_PUMP_GUARD = 10.0   # Skip if 1m candle pumped >10% (stricter)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 11: TIER B — GRADUATION AMBUSH
@@ -259,8 +259,8 @@ TIER_A_K1_PUMP_GUARD = 12.0   # Skip if 1m candle pumped >12%
 TIER_B_STAGE        = "MIGRATED"
 TIER_B_MAX_AGE_MIN  = 60       # Only tokens graduated within 60min
 TIER_B_DEV_SOLD     = True     # Require dev to have sold
-TIER_B_INSIDERS_MAX = 15.0
-TIER_B_TOP10_MAX    = 40.0
+TIER_B_INSIDERS_MAX = 12.0
+TIER_B_TOP10_MAX    = 35.0
 TIER_B_APED_MIN     = 0
 
 # Fast TP: if +30% within 10min, fire TP1 immediately
@@ -280,8 +280,8 @@ TIER_D_SCORE_TIERS = [
     {"min_score": 55, "extra": 0},   # Score 55-64 → base only
 ]
 
-TIER_D_HOLDERS_MIN   = 500
-TIER_D_TOP10_MAX     = 35.0
+TIER_D_HOLDERS_MIN   = 800
+TIER_D_TOP10_MAX     = 30.0
 TIER_D_RISK_LEVEL    = 1
 TIER_D_MIN_INFLOW    = 0
 TIER_D_MIN_CHANGE    = 0.0
@@ -299,7 +299,7 @@ VOLUME_TREND_CHECK     = True   # Check if volume is declining
 
 # Holder sell pressure detection (pre-trade)
 HOLDER_SELL_CHECK_ENABLED = True
-HOLDER_SELL_MAX_SOL_5M    = 2.0  # Max SOL sold by dev+sniper in 5min
+HOLDER_SELL_MAX_SOL_5M    = 1.5  # Max SOL sold by dev+sniper in 5min (stricter)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 14: TAKE PROFIT RULES
