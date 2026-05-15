@@ -358,15 +358,23 @@ def pre_trade_checks(addr, sym, quick=True):
         reasons.append("G3: VOLUME_PLUNGE")
         level = max(level, 3)
 
-    sniper_pct = _pct(info, "sniperHoldingPercent")
-    if sniper_pct > 10:
-        reasons.append(f"G3: SNIPERS {sniper_pct:.1f}% > 10%")
-        level = max(level, 3)
+# suspicious / phishing wallets
+suspicious_pct = _pct(info, "suspiciousHoldingPercent")
+ if suspicious_pct > 3:
+    reasons.append(f"G3: SUSPICIOUS_WALLETS {suspicious_pct:.1f}% > 5%")
+    level = max(level, 3)
+  elif suspicious_pct > 2:
+    cautions.append(f"G2: SUSPICIOUS_WALLETS {suspicious_pct:.1f}%")
+    level = max(level, 2)
 
-    suspicious_pct = _pct(info, "suspiciousHoldingPercent")
-    if suspicious_pct > 5:
-        reasons.append(f"G3: SUSPICIOUS_WALLETS {suspicious_pct:.1f}% > 5%")
-        level = max(level, 3)
+# Phishing wallet count check (OKX tags suspicious addresses)
+suspicious_count = _int_val(info, "suspiciousAddressCount")
+if suspicious_count > 5:
+    reasons.append(f"G3: PHISHING_WALLETS {suspicious_count} > 8")
+    level = max(level, 3)
+elif suspicious_count > 3:
+    cautions.append(f"G2: PHISHING_WALLETS {suspicious_count}")
+    level = max(level, 2)
 
     # Phishing wallet count check (OKX tags suspicious addresses)
     suspicious_count = _int_val(info, "suspiciousAddressCount")
