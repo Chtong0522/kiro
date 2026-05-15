@@ -41,7 +41,7 @@ _PRESETS = {
         # Risk control
         "MAX_POSITIONS": 4,
         "DAILY_LOSS_LIMIT": 10,
-        "MAX_CONSEC_LOSS": 3,
+        "MAX_CONSEC_LOSS": 15,
         "PAUSE_CONSEC_SEC": 1200,  # 20min
         "DAILY_LOSS_PAUSE": 2400,  # 40min
         # Filters (strictest: only highest quality entries)
@@ -51,8 +51,9 @@ _PRESETS = {
         "TIER_B_HOLDERS_MIN": 300,
         "TIER_D_MC_MIN": 300_000, "TIER_D_MC_MAX": 5_000_000,
         "TIER_D_LIQ_MIN": 60_000, "TIER_D_SCORE_THRESHOLD": 70,
+        "TIER_D_HOLDERS_MIN": 800,
         "TIER_S_MC_MIN": 200_000, "TIER_S_MC_MAX": 3_000_000,
-        "TIER_S_LIQ_MIN": 50_000,
+        "TIER_S_LIQ_MIN": 50_000, "TIER_S_HOLDERS_MIN": 250,
         # Volume (strictest)
         "VOLUME_5M_MIN_USD": 15_000,
         "VOLUME_BUY_SELL_RATIO": 1.5,
@@ -73,18 +74,19 @@ _PRESETS = {
         # Risk control
         "MAX_POSITIONS": 6,
         "DAILY_LOSS_LIMIT": 20,
-        "MAX_CONSEC_LOSS": 4,
+        "MAX_CONSEC_LOSS": 15,
         "PAUSE_CONSEC_SEC": 900,  # 15min
         "DAILY_LOSS_PAUSE": 1800,  # 30min
         # Filters (v8: tightened from v7 for higher quality entries)
         "TIER_A_MC_MIN": 200_000, "TIER_A_MC_MAX": 3_000_000,
         "TIER_A_LIQ_MIN": 50_000, "TIER_A_HOLDERS_MIN": 300,
         "TIER_B_MC_MIN": 100_000, "TIER_B_MC_MAX": 500_000,
-        "TIER_B_HOLDERS_MIN": 200,
+        "TIER_B_HOLDERS_MIN": 300,
         "TIER_D_MC_MIN": 200_000, "TIER_D_MC_MAX": 8_000_000,
         "TIER_D_LIQ_MIN": 50_000, "TIER_D_SCORE_THRESHOLD": 60,
+        "TIER_D_HOLDERS_MIN": 300,
         "TIER_S_MC_MIN": 150_000, "TIER_S_MC_MAX": 5_000_000,
-        "TIER_S_LIQ_MIN": 40_000,
+        "TIER_S_LIQ_MIN": 40_000, "TIER_S_HOLDERS_MIN": 250,
         # Volume (stricter: must have real activity)
         "VOLUME_5M_MIN_USD": 10_000,
         "VOLUME_BUY_SELL_RATIO": 1.3,
@@ -105,14 +107,14 @@ _PRESETS = {
         # Risk control
         "MAX_POSITIONS": 10,
         "DAILY_LOSS_LIMIT": 40,
-        "MAX_CONSEC_LOSS": 5,
+        "MAX_CONSEC_LOSS": 15,
         "PAUSE_CONSEC_SEC": 600,  # 10min
         "DAILY_LOSS_PAUSE": 1200,  # 20min
         # Filters (still stricter than v7 aggressive)
         "TIER_A_MC_MIN": 150_000, "TIER_A_MC_MAX": 5_000_000,
-        "TIER_A_LIQ_MIN": 40_000, "TIER_A_HOLDERS_MIN": 200,
+        "TIER_A_LIQ_MIN": 40_000, "TIER_A_HOLDERS_MIN": 300,
         "TIER_B_MC_MIN": 80_000, "TIER_B_MC_MAX": 800_000,
-        "TIER_B_HOLDERS_MIN": 150,
+        "TIER_B_HOLDERS_MIN": 300,
         "TIER_D_MC_MIN": 150_000, "TIER_D_MC_MAX": 12_000_000,
         "TIER_D_LIQ_MIN": 40_000, "TIER_D_SCORE_THRESHOLD": 50,
         "TIER_S_MC_MIN": 100_000, "TIER_S_MC_MAX": 8_000_000,
@@ -422,8 +424,8 @@ BALANCE_CHECK_SEC  = 60        # Balance display interval
 # SECTION 20: SAFETY & EXECUTION
 # ══════════════════════════════════════════════════════════════════════════════
 
-SLIPPAGE_BUY       = 10        # Buy slippage tolerance (%)
-SLIPPAGE_SELL      = 50        # Sell slippage tolerance (%) — high for illiquid tokens
+SLIPPAGE_BUY       = 18        # Buy slippage tolerance (%)
+SLIPPAGE_SELL      = 30        # Sell slippage tolerance (%) — high for illiquid tokens
 SOL_GAS_RESERVE    = 0.05      # Keep this much SOL for gas
 MIN_POSITION_VALUE = 0.10      # Minimum USD value to track a position
 
